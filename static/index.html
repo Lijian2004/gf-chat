@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI 女友 · 你的专属陪伴</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- 设定界面：选性格 + 起名 -->
+  <div class="setup-screen" id="setup-screen">
+    <div class="setup-card">
+      <div class="setup-head">
+        <div class="setup-logo" id="setup-logo">💞</div>
+        <h1>打造你的专属 AI 女友</h1>
+        <p>先选性格，再给她起个名字</p>
+      </div>
+
+      <div class="setup-section">
+        <p class="setup-label">选择她的性格</p>
+        <div class="personality-grid">
+          <button class="personality-card selected" data-personality="gentle" type="button">
+            <span class="personality-card__emoji">🌷</span>
+            <span class="personality-card__name">温柔</span>
+            <span class="personality-card__desc">轻声细语，治愈你的每一天</span>
+          </button>
+          <button class="personality-card" data-personality="tsundere" type="button">
+            <span class="personality-card__emoji">😤</span>
+            <span class="personality-card__name">傲娇</span>
+            <span class="personality-card__desc">口是心非，藏不住对你的喜欢</span>
+          </button>
+          <button class="personality-card" data-personality="aloof" type="button">
+            <span class="personality-card__emoji">❄️</span>
+            <span class="personality-card__name">高冷</span>
+            <span class="personality-card__desc">话少可靠，偶尔流露温柔</span>
+          </button>
+          <button class="personality-card" data-personality="sharp" type="button">
+            <span class="personality-card__emoji">⚡</span>
+            <span class="personality-card__name">犀利</span>
+            <span class="personality-card__desc">一针见血，聪明爱吐槽</span>
+          </button>
+          <button class="personality-card" data-personality="grumpy" type="button">
+            <span class="personality-card__emoji">🔥</span>
+            <span class="personality-card__name">暴躁</span>
+            <span class="personality-card__desc">脾气来得快去得快，其实很在意你</span>
+          </button>
+          <button class="personality-card" data-personality="shy" type="button">
+            <span class="personality-card__emoji">🌸</span>
+            <span class="personality-card__name">害羞</span>
+            <span class="personality-card__desc">容易脸红，需要你主动一点</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="setup-section">
+        <p class="setup-label">给她起个名字</p>
+        <input
+          class="name-input"
+          id="name-input"
+          type="text"
+          maxlength="20"
+          placeholder="比如：小爱、阿晴、软软…"
+          autocomplete="off"
+        />
+      </div>
+
+      <button class="start-btn" id="start-btn" type="button" disabled>开始我们的对话</button>
+    </div>
+  </div>
+
+  <!-- 聊天主界面 -->
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand__logo">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 2 14.6 9.4 22 12 14.6 14.6 12 22 9.4 14.6 2 12 9.4 9.4Z" />
+          </svg>
+        </div>
+        <div class="brand__text">
+          <h1 id="brand-name">AI 女友</h1>
+          <p id="brand-sub">你的专属陪伴</p>
+        </div>
+      </div>
+
+      <button class="new-chat" id="reset-btn" type="button">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M23 4v6h-6" />
+          <path d="M1 20v-6h6" />
+          <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10" />
+          <path d="M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+        </svg>
+        <span>重新设定</span>
+      </button>
+
+      <div class="sidebar__divider"></div>
+
+      <div class="gf-info">
+        <p class="tips__title">她的人设</p>
+        <div class="gf-info__row">
+          <span class="gf-info__emoji" id="gf-emoji">🌷</span>
+          <span class="gf-info__label" id="gf-label">温柔</span>
+        </div>
+        <p class="gf-info__desc" id="gf-desc">轻声细语，治愈你的每一天</p>
+      </div>
+
+      <div class="sidebar__divider"></div>
+
+      <div class="voice-picker">
+        <p class="tips__title">她的声音</p>
+        <div class="voice-picker__chips" id="voice-picker">
+          <!-- 由 script.js 动态渲染 -->
+        </div>
+      </div>
+
+      <div class="sidebar__footer">
+        <span class="model-badge">GLM-5.3-Flash</span>
+      </div>
+    </aside>
+
+    <main class="chat">
+      <header class="chat-header">
+        <div class="chat-header__title">
+          <span class="dot"></span>
+          <span id="chat-status">💞 恋爱中</span>
+        </div>
+        <div class="chat-header__actions">
+          <button class="voice-btn" id="voice-btn" type="button" aria-pressed="true" aria-label="关闭语音播报" title="关闭语音播报">
+            <svg class="icon-voice" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M11 5 6 9H2v6h4l5 4V5z" />
+              <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+              <path d="M18.5 5.5a9 9 0 0 1 0 13" />
+            </svg>
+            <svg class="icon-voice-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M11 5 6 9H2v6h4l5 4V5z" />
+              <line x1="23" y1="9" x2="17" y2="15" />
+              <line x1="17" y1="9" x2="23" y2="15" />
+            </svg>
+          </button>
+          <button class="header-reset" id="header-reset-btn" type="button" aria-label="重新设定">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M23 4v6h-6" />
+              <path d="M1 20v-6h6" />
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10" />
+              <path d="M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <div class="messages" id="messages">
+        <div class="empty-state" id="empty-state">
+          <div class="empty-state__icon">💞</div>
+          <h2>和她开始聊天吧</h2>
+          <p>输入消息，你的 AI 女友会马上回复你。</p>
+        </div>
+      </div>
+
+      <footer class="composer">
+        <form class="composer__form" id="composer-form" autocomplete="off">
+          <div class="composer__box">
+            <textarea
+              id="input"
+              rows="1"
+              placeholder="和她说点什么…"
+              spellcheck="false"
+            ></textarea>
+            <button class="mic-btn" id="mic-btn" type="button" aria-label="语音输入" title="语音输入">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                <line x1="12" y1="19" x2="12" y2="23" />
+                <line x1="8" y1="23" x2="16" y2="23" />
+              </svg>
+            </button>
+            <button class="send-btn" id="send-btn" type="submit" aria-label="发送">
+              <svg class="icon-send" id="send-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 2 11 13" />
+                <path d="M22 2 15 22 11 13 2 9 22 2z" />
+              </svg>
+              <svg class="icon-stop" id="stop-icon" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="6" y="6" width="12" height="12" rx="2" />
+              </svg>
+            </button>
+          </div>
+        </form>
+        <p class="composer__hint">AI 生成的内容可能出错，请注意甄别。</p>
+      </footer>
+    </main>
+  </div>
+
+  <!-- 访问密码登录框 -->
+  <div class="login-overlay hidden" id="login-overlay">
+    <div class="login-card">
+      <div class="login-logo">🔒</div>
+      <h2>输入访问密码</h2>
+      <p>这是你的私人 AI 女友，需要密码才能进入</p>
+      <input class="login-input" id="login-password" type="password" placeholder="请输入密码" autocomplete="current-password" />
+      <button class="login-btn" id="login-btn" type="button">进入</button>
+      <p class="login-error" id="login-error"></p>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/axios@1.6.8/dist/axios.min.js"></script>
+  <script src="/static/script.js"></script>
+</body>
+</html>

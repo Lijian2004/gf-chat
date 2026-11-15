@@ -1,0 +1,17 @@
+# 密钥与本地配置
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 本地运行产物
+server_out.log
+server_err.log
+debug_asr.wav
+tts_*.mp3
+
+# 根目录原始头像（实际用的是 static/avatar.png）
+/avatar.png

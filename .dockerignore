@@ -1,0 +1,20 @@
+# 密钥与本地配置（绝不能进镜像）
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 本地运行产物
+server_out.log
+server_err.log
+debug_asr.wav
+tts_*.mp3
+avatar.png
+
+# 其他
+.git/
+.gitignore
+README.md
