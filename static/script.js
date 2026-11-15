@@ -31,6 +31,16 @@ const locationInput = document.getElementById("location-input");
 const locationSaveBtn = document.getElementById("location-save-btn");
 const locationAutoBtn = document.getElementById("location-auto-btn");
 const locationStatusEl = document.getElementById("location-status");
+const callOverlayEl = document.getElementById("call-overlay");
+const callTimerEl = document.getElementById("call-timer");
+const callAvatarEl = document.getElementById("call-avatar");
+const callAvatarWrapEl = document.getElementById("call-avatar-wrap");
+const callNameEl = document.getElementById("call-name");
+const callStatusEl = document.getElementById("call-status");
+const callTranscriptEl = document.getElementById("call-transcript");
+const callMuteBtn = document.getElementById("call-mute-btn");
+const callHangupBtn = document.getElementById("call-hangup-btn");
+const callBtnHeader = document.getElementById("call-btn");
 
 /* 性格元数据（与后端 PERSONALITIES 保持一致，用于前端展示） */
 const PERSONALITY_META = {
@@ -408,6 +418,16 @@ function _encodeWav(samples, sampleRate) {
   return new Blob([view], { type: "audio/wav" });
 }
 
+/* 选一个浏览器支持的录制格式（语音输入与通话共用） */
+function pickRecorderMime() {
+  if (typeof MediaRecorder === "undefined") return "";
+  const candidates = ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"];
+  for (const c of candidates) {
+    if (MediaRecorder.isTypeSupported(c)) return c;
+  }
+  return "";
+}
+
 async function startRecording() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     alert("当前浏览器不支持麦克风录音，请用 Chrome / Edge。");
@@ -424,16 +444,7 @@ async function startRecording() {
     return false;
   }
 
-  // 选一个浏览器支持的录制格式
-  let mimeType = "";
-  const candidates = ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"];
-  for (const c of candidates) {
-    if (MediaRecorder.isTypeSupported(c)) {
-      mimeType = c;
-      break;
-    }
-  }
-
+  const mimeType = pickRecorderMime();
   micChunks = [];
   micRecorder = mimeType ? new MediaRecorder(micStream, { mimeType }) : new MediaRecorder(micStream);
   micRecorder.ondataavailable = (e) => {
@@ -767,6 +778,552 @@ function locationPayload() {
   }
   return null;
 }
+
+/* ============ 语音通话 ============ */
+/* 类似豆包的通话模式：全屏通话界面 + 浏览器端静音检测（VAD）自动断句。
+   对话循环：录音 → ASR 识别 → 大模型（通话模式，回复短而口语）→ 分句 TTS 边生成边播 → 继续聆听。
+   通话内容实时写入主聊天记录，挂断后可在聊天界面看到，她也记得。 */
+const CALL_VAD_MIN = 0.01;        // VAD 阈值下限
+const CALL_VAD_MAX = 0.05;        // VAD 阈值上限
+const CALL_SILENCE_MS = 1400;     // 静音多久判定「说完了」
+const CALL_MAX_UTTER_MS = 20000;  // 单段录音上限
+const CALL_POLL_MS = 100;         // VAD 轮询间隔
+const CALL_TRANSCRIPT_MAX = 8;    // 通话字幕保留条数
+
+let callActive = false;
+let callState = "idle"; // idle | connecting | listening | recognizing | thinking | speaking | muted
+let callMuted = false;
+let callMicStream = null;
+let callAudioCtx = null;
+let callAnalyser = null;
+let callVadTimer = null;
+let callRecorder = null;
+let callChunks = [];
+let callUtterStart = 0;
+let callSpeechSeen = false;
+let callSilenceSince = 0;
+let callNoiseFloor = 0.004; // 自适应噪声底（EMA），说话阈值 = max(下限, 噪声底×3)
+let callStartTs = 0;
+let callTimerInterval = null;
+let callController = null;
+let callStreamDone = true;
+let callSentenceQueue = [];
+let callTtsBusy = false;
+let callCurrentAudio = null;
+let callStatusTimer = null;
+
+function callVadThreshold() {
+  return Math.min(CALL_VAD_MAX, Math.max(CALL_VAD_MIN, callNoiseFloor * 3));
+}
+
+function setCallState(state, statusText) {
+  callState = state;
+  if (statusText != null) callStatusEl.textContent = statusText;
+  callAvatarWrapEl.classList.toggle("is-speaking", state === "speaking");
+  callAvatarWrapEl.classList.toggle("is-listening", state === "listening");
+  callAvatarWrapEl.classList.toggle("is-muted", state === "muted");
+}
+
+function flashCallStatus(msg, ms = 2000) {
+  callStatusEl.textContent = msg;
+  clearTimeout(callStatusTimer);
+  callStatusTimer = setTimeout(() => {
+    const map = {
+      connecting: "正在连接…",
+      listening: "正在聆听…",
+      recognizing: "正在识别…",
+      thinking: "思考中…",
+      speaking: "正在说话…",
+      muted: "已静音",
+    };
+    if (map[callState]) callStatusEl.textContent = map[callState];
+  }, ms);
+}
+
+function addCallBubble(role, html) {
+  const div = document.createElement("div");
+  div.className = `call-msg call-msg--${role}`;
+  div.innerHTML = html;
+  callTranscriptEl.appendChild(div);
+  callTranscriptEl.scrollTop = callTranscriptEl.scrollHeight;
+  while (callTranscriptEl.children.length > CALL_TRANSCRIPT_MAX) {
+    callTranscriptEl.removeChild(callTranscriptEl.firstChild);
+  }
+  return div;
+}
+
+function updateCallTimer() {
+  const s = Math.floor((Date.now() - callStartTs) / 1000);
+  callTimerEl.textContent =
+    String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
+}
+
+/* ============ 通话入口 / 挂断 ============ */
+async function startCall() {
+  if (callActive) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === "undefined") {
+    alert("当前浏览器不支持语音通话，请用较新的 Chrome / Edge。");
+    return;
+  }
+
+  callActive = true;
+  callMuted = false;
+  callMuteBtn.classList.remove("is-muted");
+  callMuteBtn.title = "静音";
+  callSentenceQueue = [];
+  callTtsBusy = false;
+  callStreamDone = true;
+  callNoiseFloor = 0.004;
+  stopAudio(); // 停掉主聊天正在播的语音，避免抢音频
+
+  callOverlayEl.classList.remove("hidden");
+  callTranscriptEl.innerHTML = "";
+  callTimerEl.textContent = "00:00";
+
+  const meta = PERSONALITY_META[gfPersonality] || PERSONALITY_META.gentle;
+  callNameEl.textContent = gfName || "AI 女友";
+  injectAvatar(callAvatarEl, meta.emoji, meta.label);
+
+  callStartTs = Date.now();
+  clearInterval(callTimerInterval);
+  callTimerInterval = setInterval(updateCallTimer, 1000);
+
+  setCallState("connecting", "正在连接…");
+
+  try {
+    callMicStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    callStatusEl.textContent = "无法访问麦克风，通话结束";
+    setTimeout(endCall, 1200);
+    return;
+  }
+
+  // VAD：用 AnalyserNode 实时监测麦克风音量（只分析，不连输出，避免回声）
+  try {
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    callAudioCtx = new Ctor();
+    if (callAudioCtx.resume) callAudioCtx.resume().catch(() => {});
+    const source = callAudioCtx.createMediaStreamSource(callMicStream);
+    callAnalyser = callAudioCtx.createAnalyser();
+    callAnalyser.fftSize = 1024;
+    source.connect(callAnalyser);
+  } catch (e) {
+    callAnalyser = null;
+  }
+  clearInterval(callVadTimer);
+  callVadTimer = setInterval(vadTick, CALL_POLL_MS);
+
+  // 问候语播放完毕后（音频队列排空事件）自动进入聆听状态
+  await callGreeting();
+}
+
+function endCall() {
+  if (!callActive) {
+    callOverlayEl.classList.add("hidden");
+    return;
+  }
+  callActive = false;
+  if (callController) {
+    try { callController.abort(); } catch (e) { /* 忽略 */ }
+  }
+  callController = null;
+  callSentenceQueue = [];
+  callTtsBusy = false;
+  stopCallAudio();
+  if (callVadTimer) { clearInterval(callVadTimer); callVadTimer = null; }
+  if (callTimerInterval) { clearInterval(callTimerInterval); callTimerInterval = null; }
+  if (callRecorder && callRecorder.state !== "inactive") {
+    try { callRecorder.stop(); } catch (e) { /* 忽略 */ }
+  }
+  callRecorder = null;
+  if (callMicStream) {
+    callMicStream.getTracks().forEach((t) => t.stop());
+    callMicStream = null;
+  }
+  if (callAudioCtx) {
+    try { callAudioCtx.close(); } catch (e) { /* 忽略 */ }
+    callAudioCtx = null;
+    callAnalyser = null;
+  }
+  clearTimeout(callStatusTimer);
+  setCallState("idle");
+  callOverlayEl.classList.add("hidden");
+  scrollToBottom();
+  inputEl.focus();
+}
+
+/* ============ 聆听与静音检测（VAD） ============ */
+function startListening() {
+  if (!callActive || callState === "listening") return;
+  if (callCurrentAudio || callTtsBusy) return; // 她还在说话，等音频播完（由排空事件触发）
+  if (callMuted) {
+    setCallState("muted", "已静音");
+    return;
+  }
+  callSpeechSeen = false;
+  callSilenceSince = 0;
+  callUtterStart = Date.now();
+  startCallRecorder();
+  setCallState("listening", "正在聆听…");
+}
+
+function callRms() {
+  if (!callAnalyser) return 0;
+  const buf = new Float32Array(callAnalyser.fftSize);
+  callAnalyser.getFloatTimeDomainData(buf);
+  let sum = 0;
+  for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+  return Math.sqrt(sum / buf.length);
+}
+
+function vadTick() {
+  if (!callActive || callMuted || callState !== "listening") return;
+  const now = Date.now();
+  const level = callRms();
+  if (level > callVadThreshold()) {
+    callSpeechSeen = true;
+    callSilenceSince = 0;
+  } else {
+    if (callSpeechSeen) {
+      if (!callSilenceSince) callSilenceSince = now;
+      if (now - callSilenceSince >= CALL_SILENCE_MS) {
+        stopUtterance();
+        return;
+      }
+    }
+    callNoiseFloor = callNoiseFloor * 0.9 + level * 0.1; // 静音帧持续更新噪声底
+  }
+  if (now - callUtterStart >= CALL_MAX_UTTER_MS) {
+    stopUtterance();
+  }
+}
+
+function startCallRecorder() {
+  if (!callMicStream) return;
+  callChunks = [];
+  const mimeType = pickRecorderMime();
+  try {
+    callRecorder = mimeType
+      ? new MediaRecorder(callMicStream, { mimeType })
+      : new MediaRecorder(callMicStream);
+  } catch (e) {
+    callRecorder = null;
+    return;
+  }
+  callRecorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) callChunks.push(e.data);
+  };
+  callRecorder.start();
+}
+
+function stopCallRecorder(rec) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(); } };
+    rec.onstop = finish;
+    try { rec.stop(); } catch (e) { finish(); }
+    setTimeout(finish, 2000); // 兜底
+  });
+}
+
+async function stopUtterance(discard = false) {
+  if (callState !== "listening") return;
+  setCallState("recognizing", discard ? "" : "正在识别…");
+  const rec = callRecorder;
+  callRecorder = null;
+  if (!rec || rec.state === "inactive") {
+    if (!discard) startListening();
+    return;
+  }
+  await stopCallRecorder(rec);
+  if (discard || !callActive) return;
+
+  const blob = new Blob(callChunks, { type: rec.mimeType || "audio/webm" });
+  callChunks = [];
+  if (!blob.size) {
+    startListening();
+    return;
+  }
+
+  try {
+    const { blob: wavBlob, peak } = await _decodeToWav(blob);
+    if (peak < 0.005 || !callSpeechSeen) {
+      startListening(); // 误触发 / 纯噪声，继续聆听
+      return;
+    }
+    const res = await axios.post("/api/asr?format=wav", wavBlob, {
+      headers: { "Content-Type": "application/octet-stream" },
+      timeout: 30000,
+    });
+    const text = ((res.data && res.data.text) || "").trim();
+    if (!text) {
+      flashCallStatus("没听清，再说说？");
+      startListening();
+      return;
+    }
+    await handleCallTurn(text);
+  } catch (e) {
+    const msg =
+      (e.response && e.response.data && e.response.data.error) ||
+      e.message || "识别失败";
+    flashCallStatus(`语音识别失败：${msg}`, 3000);
+    if (callActive) startListening();
+  }
+}
+
+/* ============ 通话中的一轮对话 ============ */
+async function handleCallTurn(text) {
+  addCallBubble("user", escapeHtml(text).replace(/\n/g, "<br>"));
+  addUserMessage(text); // 同步写入主聊天界面，挂断后可见
+  history.push({ role: "user", content: text });
+
+  const payload = {
+    messages: history.slice(),
+    name: gfName,
+    personality: gfPersonality,
+    call: true,
+  };
+  if (greetingText) payload.greeting_text = greetingText;
+  const loc = locationPayload();
+  if (loc) payload.location = loc;
+
+  await runCallReply(payload);
+}
+
+async function callGreeting() {
+  if (!callActive) return;
+  const payload = {
+    greeting: true,
+    messages: [],
+    name: gfName,
+    personality: gfPersonality,
+    call: true,
+  };
+  const loc = locationPayload();
+  if (loc) payload.location = loc;
+  await runCallReply(payload, { greeting: true }); // 字幕由 runCallReply 内部渲染
+}
+
+/* 把流式文本按句切分：返回 { out: 完整句子列表, rest: 未成句的尾巴 } */
+function extractCallSentences(buffer, flush = false) {
+  const out = [];
+  let start = 0;
+  const re = /[。！？!?；;\n～~…]/g;
+  let m;
+  while ((m = re.exec(buffer))) {
+    const seg = buffer.slice(start, m.index + 1).trim();
+    // 过滤纯标点碎片（如「……」）
+    if (seg && /[^\s。！？!?；;～~…，,、.]/.test(seg)) out.push(seg);
+    start = m.index + 1;
+  }
+  const rest = buffer.slice(start);
+  if (flush && rest.trim()) {
+    out.push(rest.trim());
+    return { out, rest: "" };
+  }
+  return { out, rest };
+}
+
+/* 流式获取她的回复：边流式接收边分句送 TTS 队列播放 */
+async function runCallReply(payload, opts = {}) {
+  const isGreeting = !!opts.greeting;
+  let acc = "";
+  let pending = "";
+  let chatBubble = null;
+  const transcriptBubble = addCallBubble("assistant", "");
+
+  if (!isGreeting) {
+    chatBubble = createMessage("assistant");
+    showEmpty(false);
+  }
+
+  callStreamDone = false;
+  callController = new AbortController();
+  setCallState("thinking", "思考中…");
+
+  const pushText = (full) => {
+    acc = full;
+    if (chatBubble) updateBubble(chatBubble, acc);
+    transcriptBubble.innerHTML = renderMarkdown(acc);
+    callTranscriptEl.scrollTop = callTranscriptEl.scrollHeight;
+  };
+
+  try {
+    const res = await axios.post("/api/chat", payload, {
+      responseType: "text",
+      signal: callController.signal,
+      onDownloadProgress: (e) => {
+        const xhr = e.currentTarget || e.target;
+        const full = (xhr.responseText != null ? xhr.responseText : xhr.response) || "";
+        if (full.length > acc.length) {
+          pending += full.slice(acc.length);
+          pushText(full);
+          const { out, rest } = extractCallSentences(pending);
+          pending = rest;
+          enqueueCallSentences(out);
+        }
+      },
+    });
+
+    const finalText = res.data || "";
+    if (finalText.length > acc.length) {
+      pending += finalText.slice(acc.length);
+      pushText(finalText);
+    }
+    if (pending.trim()) {
+      enqueueCallSentences([pending.trim()]);
+      pending = "";
+    }
+  } catch (err) {
+    if (axios.isCancel(err) || (err && err.code === "ERR_CANCELED")) {
+      acc += "\n\n（已停止）";
+    } else {
+      const msg =
+        (err.response && err.response.data && err.response.data.error) ||
+        err.message || "网络错误";
+      acc += `\n\n[请求失败] ${msg}`;
+      if (chatBubble) chatBubble.classList.add("bubble--error");
+    }
+    if (chatBubble) updateBubble(chatBubble, acc);
+  } finally {
+    callController = null;
+    callStreamDone = true;
+    transcriptBubble.innerHTML = renderMarkdown(acc || "（未收到回复）");
+    callTranscriptEl.scrollTop = callTranscriptEl.scrollHeight;
+  }
+
+  if (!isGreeting && acc.trim()) {
+    history.push({ role: "assistant", content: acc });
+    saveState();
+  } else if (!isGreeting && !acc.trim() && chatBubble && chatBubble.parentNode) {
+    chatBubble.parentNode.removeChild(chatBubble); // 空回复不留在主聊天
+  }
+
+  pumpCallTTS(); // 若音频队列已空则立即收尾，否则播完后触发
+  return acc;
+}
+
+/* ============ 分句 TTS 播放队列 ============ */
+function enqueueCallSentences(list) {
+  if (!list.length || !callActive) return;
+  callSentenceQueue.push(...list);
+  pumpCallTTS();
+}
+
+async function pumpCallTTS() {
+  if (!callActive || callTtsBusy) return;
+  const sentence = callSentenceQueue.shift();
+  if (!sentence) {
+    if (callStreamDone) onCallReplyAudioDone();
+    return;
+  }
+  callTtsBusy = true;
+  await speakCallSentence(sentence);
+  callTtsBusy = false;
+  if (callActive) pumpCallTTS();
+}
+
+function onCallReplyAudioDone() {
+  if (!callActive) return;
+  startListening(); // 内部有幂等保护
+}
+
+async function speakCallSentence(text) {
+  if (!callActive) return;
+  setCallState("speaking", "正在说话…");
+  const clean = textForSpeech(text);
+  if (!clean) return;
+  try {
+    const res = await axios.post(
+      "/api/tts",
+      { text: clean, voice: voicePersona },
+      { responseType: "blob", timeout: 30000 }
+    );
+    if (!callActive) return; // 等待期间已挂断，不再播放
+    if (!res.data || (res.data.size != null && res.data.size === 0)) throw new Error("empty audio");
+    await playCallAudio(res.data);
+  } catch (e) {
+    if (!callActive) return;
+    await speakCallFallback(clean); // 网络合成失败时退回浏览器语音
+  }
+}
+
+function playCallAudio(blob) {
+  return new Promise((resolve) => {
+    if (!callActive) { resolve(); return; }
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(); } };
+    let url;
+    try { url = URL.createObjectURL(blob); } catch (e) { finish(); return; }
+    const audio = new Audio(url);
+    callCurrentAudio = { audio, url };
+    const finishAndCleanup = () => {
+      if (callCurrentAudio && callCurrentAudio.audio === audio) callCurrentAudio = null;
+      try { URL.revokeObjectURL(url); } catch (e) { /* 忽略 */ }
+      finish();
+    };
+    audio.onended = finishAndCleanup;
+    audio.onerror = finishAndCleanup;
+    const p = audio.play();
+    if (p && p.catch) p.catch(finishAndCleanup);
+    setTimeout(finish, 120000); // 绝对兜底
+  });
+}
+
+function speakCallFallback(text) {
+  return new Promise((resolve) => {
+    if (!("speechSynthesis" in window)) { resolve(); return; }
+    try {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = "zh-CN";
+      u.rate = 1.05;
+      u.pitch = 1.05;
+      if (selectedVoice) u.voice = selectedVoice;
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      u.onend = finish;
+      u.onerror = finish;
+      speechSynthesis.speak(u);
+      setTimeout(finish, 20000); // 兜底
+    } catch (e) {
+      resolve();
+    }
+  });
+}
+
+function stopCallAudio() {
+  if (callCurrentAudio) {
+    try { callCurrentAudio.audio.pause(); } catch (e) { /* 忽略 */ }
+    try { URL.revokeObjectURL(callCurrentAudio.url); } catch (e) { /* 忽略 */ }
+    callCurrentAudio = null;
+  }
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
+}
+
+/* ============ 通话事件绑定 ============ */
+callMuteBtn.addEventListener("click", () => {
+  if (!callActive) return;
+  callMuted = !callMuted;
+  callMuteBtn.classList.toggle("is-muted", callMuted);
+  callMuteBtn.title = callMuted ? "取消静音" : "静音";
+  if (callMuted) {
+    if (callState === "listening") stopUtterance(true);
+    setCallState("muted", "已静音");
+  } else if (callCurrentAudio || callTtsBusy) {
+    // 她还在说话：先显示说话状态，等音频播完由排空事件自动进入聆听
+    setCallState("speaking", "正在说话…");
+  } else {
+    startListening();
+  }
+});
+
+callHangupBtn.addEventListener("click", endCall);
+
+callBtnHeader.addEventListener("click", () => {
+  if (callActive) return;
+  if (isStreaming) stopGeneration();
+  startCall();
+});
 
 /* ============ 流式请求 ============ */
 async function streamReply(payload) {
