@@ -734,7 +734,9 @@ async function saveManualCity() {
   }
 }
 
-/* 初始化定位：有缓存先用缓存，否则自动定位；之后每 10 分钟刷新天气 */
+/* 初始化定位：有缓存先用缓存，否则自动定位；之后每 10 分钟刷新天气。
+   可安全重复调用（登录成功后会补跑一次），定时器只注册一份 */
+let locationTimerStarted = false;
 async function initLocation() {
   const saved = localStorage.getItem(STORAGE_KEYS.location);
   if (saved) {
@@ -746,10 +748,13 @@ async function initLocation() {
   if (locationInfo) {
     renderLocation();
     fetchWeather();
-  } else {
+  } else if (!locBusy) {
     detectLocation();
   }
-  setInterval(() => { if (locationInfo) fetchWeather(); }, 10 * 60 * 1000);
+  if (!locationTimerStarted) {
+    locationTimerStarted = true;
+    setInterval(() => { if (locationInfo) fetchWeather(); }, 10 * 60 * 1000);
+  }
 }
 
 locationChip.addEventListener("click", () => {
@@ -1153,8 +1158,8 @@ async function runCallReply(payload, opts = {}) {
       responseType: "text",
       signal: callController.signal,
       onDownloadProgress: (e) => {
-        const xhr = e.currentTarget || e.target;
-        const full = (xhr.responseText != null ? xhr.responseText : xhr.response) || "";
+        const xhr = (e && (e.currentTarget || e.target)) || null;
+        const full = ((xhr && xhr.responseText != null ? xhr.responseText : xhr && xhr.response) || "");
         if (full.length > acc.length) {
           pending += full.slice(acc.length);
           pushText(full);
@@ -1338,8 +1343,8 @@ async function streamReply(payload) {
       responseType: "text",
       signal: controller.signal,
       onDownloadProgress: (e) => {
-        const xhr = e.currentTarget || e.target;
-        const full = (xhr.responseText != null ? xhr.responseText : xhr.response) || "";
+        const xhr = (e && (e.currentTarget || e.target)) || null;
+        const full = ((xhr && xhr.responseText != null ? xhr.responseText : xhr && xhr.response) || "");
         if (full.length > acc.length) {
           acc = full;
           updateBubble(bubble, acc);
@@ -1568,6 +1573,9 @@ async function doLogin() {
     loginOverlayEl.classList.add("hidden");
     loginPasswordEl.value = "";
     loginErrorEl.textContent = "";
+    // 登录前页面初始化的请求（音色列表/定位）会因 401 失败，登录后补拉一次
+    if (!voicePersonas.length) loadVoicePersonas();
+    initLocation();
   } catch (e) {
     loginErrorEl.textContent = "密码错误，请重试";
   } finally {
