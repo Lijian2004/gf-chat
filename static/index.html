@@ -120,6 +120,28 @@
         </div>
       </div>
 
+      <div class="sidebar__divider"></div>
+
+      <div class="location-picker">
+        <p class="tips__title">你在的城市</p>
+        <button class="location-chip" id="location-chip" type="button" title="点击修改城市">📍 设置城市</button>
+        <div class="location-editor hidden" id="location-editor">
+          <input
+            class="location-input"
+            id="location-input"
+            type="text"
+            maxlength="30"
+            placeholder="输入城市名，如：杭州"
+            autocomplete="off"
+          />
+          <div class="location-editor__actions">
+            <button class="location-action primary" id="location-save-btn" type="button">保存</button>
+            <button class="location-action" id="location-auto-btn" type="button">自动定位</button>
+          </div>
+          <p class="location-status" id="location-status"></p>
+        </div>
+      </div>
+
       <div class="sidebar__footer">
         <span class="model-badge">GLM-5.3-Flash</span>
       </div>

@@ -25,6 +25,12 @@ const loginOverlayEl = document.getElementById("login-overlay");
 const loginPasswordEl = document.getElementById("login-password");
 const loginBtnEl = document.getElementById("login-btn");
 const loginErrorEl = document.getElementById("login-error");
+const locationChip = document.getElementById("location-chip");
+const locationEditorEl = document.getElementById("location-editor");
+const locationInput = document.getElementById("location-input");
+const locationSaveBtn = document.getElementById("location-save-btn");
+const locationAutoBtn = document.getElementById("location-auto-btn");
+const locationStatusEl = document.getElementById("location-status");
 
 /* 性格元数据（与后端 PERSONALITIES 保持一致，用于前端展示） */
 const PERSONALITY_META = {
@@ -52,6 +58,7 @@ const STORAGE_KEYS = {
   greeting: "gf_greeting",
   voice: "gf_voice",
   voicePersona: "gf_voice_persona",
+  location: "gf_location",
 };
 const MAX_SAVED_HISTORY = 60;
 
@@ -571,6 +578,196 @@ async function handleMicClick() {
   }
 }
 
+/* ============ 城市定位与天气 ============ */
+/* 定位优先级：本地缓存 → IP 定位（静默）→ 浏览器定位（需授权）→ 手动输入城市。
+   城市和实时天气随每条消息发给后端，注入她的 system prompt，
+   这样她就能自然地提醒你降温添衣、下雨带伞。 */
+let locationInfo = null; // { city, lat, lon }
+let weatherText = "";    // 完整天气描述（发给后端注入人设）
+let weatherShort = "";   // 短描述（侧边栏 chip 展示用）
+let locBusy = false;
+
+function renderLocation() {
+  if (locationInfo && locationInfo.city && weatherShort) {
+    locationChip.textContent = `📍 ${locationInfo.city} · ${weatherShort}`;
+  } else if (locationInfo && locationInfo.city) {
+    locationChip.textContent = `📍 ${locationInfo.city}`;
+  } else if (locationInfo && weatherShort) {
+    locationChip.textContent = `📍 ${weatherShort}`;
+  } else {
+    locationChip.textContent = "📍 设置城市";
+  }
+}
+
+function saveLocationLocal() {
+  try {
+    localStorage.setItem(STORAGE_KEYS.location, JSON.stringify(locationInfo));
+  } catch (e) { /* 存储不可用时静默降级 */ }
+}
+
+/* 查询天气并更新展示；locationInfo 决定用坐标还是城市名请求 */
+async function fetchWeather() {
+  if (!locationInfo) return false;
+  const params = {};
+  if (locationInfo.lat != null && locationInfo.lon != null) {
+    params.lat = locationInfo.lat;
+    params.lon = locationInfo.lon;
+    if (locationInfo.city) params.name = locationInfo.city;
+  } else if (locationInfo.city) {
+    params.city = locationInfo.city;
+  } else {
+    return false;
+  }
+  try {
+    const res = await axios.get("/api/weather", { params, timeout: 9000 });
+    const d = res.data || {};
+    if (!d.weather_text) return false;
+    locationInfo = {
+      city: d.city || locationInfo.city || "",
+      lat: d.lat,
+      lon: d.lon,
+    };
+    weatherText = d.weather_text;
+    weatherShort = d.short || "";
+    saveLocationLocal();
+    renderLocation();
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/* 浏览器定位（需用户授权），包装成 Promise */
+function getBrowserCoords(timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    if (!("geolocation" in navigator)) {
+      reject(new Error("浏览器不支持定位"));
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
+      (err) => reject(err),
+      { timeout: timeoutMs, maximumAge: 10 * 60 * 1000, enableHighAccuracy: false }
+    );
+  });
+}
+
+async function locateByIP() {
+  const res = await axios.get("/api/location/ip", { timeout: 7000 });
+  const d = res.data || {};
+  if (!d.city || d.lat == null) return false;
+  locationInfo = { city: d.city, lat: d.lat, lon: d.lon };
+  saveLocationLocal();
+  await fetchWeather();
+  return true;
+}
+
+async function locateByBrowser() {
+  const c = await getBrowserCoords();
+  locationInfo = { city: "", lat: c.lat, lon: c.lon };
+  await fetchWeather(); // 服务端反查城市名
+  return !!(locationInfo && locationInfo.city);
+}
+
+/* 完整自动定位流程：IP → 浏览器定位 */
+async function detectLocation() {
+  if (locBusy) return;
+  locBusy = true;
+  locationAutoBtn.disabled = true;
+  locationStatusEl.classList.remove("error");
+  locationStatusEl.textContent = "定位中…";
+  let ok = false;
+  try { ok = await locateByIP(); } catch (e) { /* 忽略，继续浏览器定位 */ }
+  if (!ok) {
+    try { ok = await locateByBrowser(); } catch (e) { /* 授权拒绝等 */ }
+  }
+  if (ok) {
+    locationStatusEl.textContent = "";
+    locationEditorEl.classList.add("hidden");
+  } else {
+    locationChip.textContent = "📍 设置城市";
+    locationStatusEl.textContent = "自动定位不可用，试试手动输入城市名";
+    locationStatusEl.classList.add("error");
+  }
+  locationAutoBtn.disabled = false;
+  locBusy = false;
+}
+
+/* 手动保存城市 */
+async function saveManualCity() {
+  const name = locationInput.value.trim();
+  if (!name || locBusy) return;
+  locBusy = true;
+  locationSaveBtn.disabled = true;
+  locationStatusEl.classList.remove("error");
+  locationStatusEl.textContent = "查询中…";
+  try {
+    const res = await axios.get("/api/weather", { params: { city: name }, timeout: 9000 });
+    const d = res.data || {};
+    locationInfo = { city: d.city || name, lat: d.lat, lon: d.lon };
+    weatherText = d.weather_text || "";
+    weatherShort = d.short || "";
+    saveLocationLocal();
+    renderLocation();
+    locationStatusEl.textContent = "";
+    locationEditorEl.classList.add("hidden");
+  } catch (e) {
+    const msg =
+      (e.response && e.response.data && e.response.data.error) ||
+      "查询失败，请稍后再试";
+    locationStatusEl.textContent = msg;
+    locationStatusEl.classList.add("error");
+  } finally {
+    locationSaveBtn.disabled = false;
+    locBusy = false;
+  }
+}
+
+/* 初始化定位：有缓存先用缓存，否则自动定位；之后每 10 分钟刷新天气 */
+async function initLocation() {
+  const saved = localStorage.getItem(STORAGE_KEYS.location);
+  if (saved) {
+    try {
+      const d = JSON.parse(saved);
+      if (d && (d.city || d.lat != null)) locationInfo = d;
+    } catch (e) { /* 数据损坏则重新定位 */ }
+  }
+  if (locationInfo) {
+    renderLocation();
+    fetchWeather();
+  } else {
+    detectLocation();
+  }
+  setInterval(() => { if (locationInfo) fetchWeather(); }, 10 * 60 * 1000);
+}
+
+locationChip.addEventListener("click", () => {
+  const nowHidden = locationEditorEl.classList.toggle("hidden");
+  if (!nowHidden) {
+    locationInput.value = (locationInfo && locationInfo.city) || "";
+    locationStatusEl.textContent = "";
+    locationStatusEl.classList.remove("error");
+    locationInput.focus();
+  }
+});
+
+locationSaveBtn.addEventListener("click", saveManualCity);
+locationAutoBtn.addEventListener("click", detectLocation);
+locationInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    saveManualCity();
+  }
+});
+
+/* 消息请求携带的位置数据（供后端注入人设） */
+function locationPayload() {
+  if (locationInfo && (locationInfo.city || weatherText)) {
+    return { city: locationInfo.city || "", weather_text: weatherText };
+  }
+  return null;
+}
+
 /* ============ 流式请求 ============ */
 async function streamReply(payload) {
   const bubble = addAssistantPlaceholder();
@@ -642,6 +839,8 @@ async function sendMessage(userText) {
     personality: gfPersonality,
   };
   if (greetingText) payload.greeting_text = greetingText;
+  const loc = locationPayload();
+  if (loc) payload.location = loc;
 
   const reply = await streamReply(payload);
   if (reply.trim()) {
@@ -655,12 +854,15 @@ async function sendMessage(userText) {
 async function startGreeting() {
   // 开场白仅作展示，不写入 history（避免后续请求以 assistant 开头导致 API 报错）；
   // 通过 greeting_text 作为上下文传给后端，保证模型知道自己说过什么
-  const reply = await streamReply({
+  const payload = {
     greeting: true,
     messages: [],
     name: gfName,
     personality: gfPersonality,
-  });
+  };
+  const loc = locationPayload();
+  if (loc) payload.location = loc;
+  const reply = await streamReply(payload);
   if (reply.trim()) {
     greetingText = reply;
     saveState();
@@ -869,6 +1071,8 @@ loginPasswordEl.addEventListener("keydown", (e) => {
   initVoices();
   updateVoiceUI();
   loadVoicePersonas();
+
+  initLocation();
 
   fetchModelBadge();
 
