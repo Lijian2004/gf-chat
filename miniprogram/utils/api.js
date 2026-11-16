@@ -128,7 +128,23 @@ function chatStream(payload, hooks = {}) {
       header: { "Content-Type": "application/json" },
       enableChunked: true,
       timeout: 60000,
-      success: () => {
+      success: (res) => {
+        // wx.request 的 success 只代表网络层成功，必须自查 HTTP 状态码
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          const d = res.data;
+          const msg = (d && d.error) || `HTTP ${res.statusCode}`;
+          resolve({
+            text: acc,
+            canceled: aborted,
+            err: Object.assign(new Error(msg), { statusCode: res.statusCode }),
+          });
+          return;
+        }
+        // 兼容兜底：部分环境的 enableChunked 不触发 onChunkReceived，
+        // 完整响应体只在 success 的 res.data 里（正常分片路径下 acc 已非空，这里不会重复）
+        if (!acc && res.data) {
+          ingest(typeof res.data === "string" ? res.data : JSON.stringify(res.data));
+        }
         if (hooks.onDone) hooks.onDone(pending, acc);
         pending = "";
         resolve({ text: acc, canceled: aborted, err: null });

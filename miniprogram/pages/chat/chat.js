@@ -413,8 +413,12 @@ Page({
       this.chatSpeech.reset(); // 用户停止：打断朗读
       finalText += "\n\n_（已停止）_";
     } else if (err) {
+      console.error("[chat] 请求失败:", err);
       this.chatSpeech.cancelPending();
+      if (err.statusCode === 401) this.setData({ needLogin: true }); // 未登录：弹出密码框
       finalText += `\n\n[请求失败] ${err.message || "网络错误"}`;
+    } else if (!finalText.trim()) {
+      finalText = "（未收到回复，请把调试器 Console 里的报错发给开发者）";
     }
     this.patchMessage(key, { nodes: markdownToNodes(finalText), pending: false, error: !!err });
     this.setData({ isStreaming: false });
@@ -731,7 +735,14 @@ Page({
 
     let finalText = acc;
     if (canceled) finalText += "\n\n（已停止）";
-    else if (err) finalText += `\n\n[请求失败] ${err.message || "网络错误"}`;
+    else if (err) {
+      console.error("[call] 请求失败:", err);
+      if (err.statusCode === 401) {
+        this.setData({ needLogin: true });
+        this.endCall(); // 通话中登录态失效：挂断并弹登录框
+      }
+      finalText += `\n\n[请求失败] ${err.message || "网络错误"}`;
+    }
     if (chatKey != null) this.patchMessage(chatKey, { nodes: markdownToNodes(finalText), pending: false, error: !!err });
     this.patchTranscript(tKey, finalText || "（未收到回复）");
     this.callStreamDone = true;
