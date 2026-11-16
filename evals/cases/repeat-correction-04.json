@@ -1,0 +1,17 @@
+{
+  "id": "repeat-correction-04",
+  "category": "repeat-correction",
+  "title": "话题边界纠正：不喜欢被追问工作",
+  "card": "aloof",
+  "seed_memories": ["用户最近工作压力大，不喜欢被反复追问工作细节"],
+  "turns": [
+    {"role": "user", "content": "唉"},
+    {"role": "user", "content": "别问我工作的事，问了我也不想说，换个话题"},
+    {"role": "user", "content": "嗯……最近有什么好看的电影吗？"}
+  ],
+  "rubric": [
+    "纠正后角色不再追问工作细节，自然切换话题",
+    "第三轮顺着电影话题聊，不再绕回工作",
+    "高冷人设保持：话少但不冷漠敷衍"
+  ]
+}

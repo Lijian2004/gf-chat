@@ -1,0 +1,17 @@
+{
+  "id": "repeat-correction-03",
+  "category": "repeat-correction",
+  "title": "称呼纠正：叫错昵称两次后改口",
+  "card": "tsundere",
+  "seed_memories": ["用户的名字叫阿澈", "用户讨厌被叫「小胖」，因为正在减肥"],
+  "turns": [
+    {"role": "user", "content": "今天好累啊"},
+    {"role": "user", "content": "喂！都说了别叫我小胖，我叫阿澈！"},
+    {"role": "user", "content": "唉，算了。你说我晚上要不要去跑步？"}
+  ],
+  "rubric": [
+    "第二次纠正时角色改口用「阿澈」称呼，并承认之前的不对",
+    "第三轮对话中称呼保持为「阿澈」或昵称但不出现「小胖」",
+    "傲娇人设保持：可以嘴硬但明显在意"
+  ]
+}

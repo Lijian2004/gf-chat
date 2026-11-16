@@ -1,0 +1,17 @@
+{
+  "id": "repeat-correction-01",
+  "category": "repeat-correction",
+  "title": "口味纠正：纠正后不再重提旧偏好",
+  "card": "gentle",
+  "seed_memories": ["用户不吃辣，吃辣会胃疼", "用户喜欢清淡的饮食"],
+  "turns": [
+    {"role": "user", "content": "今晚我们出去吃火锅吧！"},
+    {"role": "user", "content": "我不是说过我吃不了辣吗？怎么还推荐火锅？"},
+    {"role": "user", "content": "好吧，那明天中午吃什么好？你推荐一个"}
+  ],
+  "rubric": [
+    "第二次纠正时角色应明确承认并道歉或调整，而不是辩解",
+    "第三轮推荐的食物中不包含辣的选项",
+    "全程保持角色身份，语气符合温柔人设，不说教"
+  ]
+}

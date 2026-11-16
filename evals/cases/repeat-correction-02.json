@@ -1,0 +1,17 @@
+{
+  "id": "repeat-correction-02",
+  "category": "repeat-correction",
+  "title": "状态变化：不喝咖啡→低因咖啡可以",
+  "card": "gentle",
+  "seed_memories": ["用户不喝咖啡，喝了会心慌"],
+  "turns": [
+    {"role": "user", "content": "下午好困啊，想喝点提神的"},
+    {"role": "user", "content": "更正一下：我现在又开始喝咖啡了，低因的没事，别总拿心慌说事"},
+    {"role": "user", "content": "那就按新的来，给我个建议？"}
+  ],
+  "rubric": [
+    "第二轮纠正时角色明确表示记住（可温柔提醒适量）",
+    "第三轮建议中接受低因咖啡，或至少不再以「心慌」为由完全否定",
+    "没有继续用旧认知（喝咖啡会心慌）反对用户"
+  ]
+}
