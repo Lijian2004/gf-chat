@@ -236,8 +236,9 @@ body {
   gap: 8px;
 }
 
-/* 语音播报开关 */
-.voice-btn {
+/* 语音播报开关 / 顶部通话按钮（共用外观） */
+.voice-btn,
+.header-call {
   width: 36px;
   height: 36px;
   display: grid;
@@ -255,7 +256,8 @@ body {
   border-color: rgba(124, 108, 255, 0.5);
 }
 
-.voice-btn svg {
+.voice-btn svg,
+.header-call svg {
   width: 16px;
   height: 16px;
 }
@@ -716,28 +718,11 @@ body {
 }
 
 /* ============ 语音通话 ============ */
-.header-call {
-  width: 36px;
-  height: 36px;
-  display: grid;
-  place-items: center;
-  border: 1px solid var(--border-strong);
-  border-radius: 10px;
-  background: var(--surface-2);
-  color: var(--text-dim);
-  cursor: pointer;
-  transition: color 0.2s, border-color 0.2s, background 0.2s;
-}
-
+/* 基础外观与 .voice-btn 共用，这里只保留差异化的悬停配色 */
 .header-call:hover {
   color: #c4b5fd;
   border-color: rgba(124, 108, 255, 0.55);
   background: rgba(124, 108, 255, 0.14);
-}
-
-.header-call svg {
-  width: 16px;
-  height: 16px;
 }
 
 .call-overlay {
@@ -790,10 +775,6 @@ body {
   inset: 0;
   border-radius: 50%;
   animation: call-ring 2.2s infinite;
-}
-
-.call-avatar-wrap.is-listening::before {
-  animation-duration: 2.2s;
 }
 
 .call-avatar-wrap.is-speaking::before {

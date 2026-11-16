@@ -101,6 +101,15 @@ function escapeHtml(str) {
     .replace(/"/g, "&quot;");
 }
 
+/* 统一提取 axios 错误信息（后端返回 { error } 字段或异常消息） */
+function apiErrorText(e, fallback) {
+  return (
+    (e && e.response && e.response.data && e.response.data.error) ||
+    e.message ||
+    fallback
+  );
+}
+
 // 轻量 Markdown 渲染：代码块、行内代码、粗体、斜体、链接、换行
 function renderMarkdown(md) {
   const codeBlocks = [];
@@ -300,23 +309,38 @@ function speakFallback(text) {
       u.pitch = 1.05;
       if (selectedVoice) u.voice = selectedVoice;
       let done = false;
-      const finish = () => { if (!done) { done = true; resolve(); } };
+      let timer = null;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        resolve();
+      };
       u.onend = finish;
       u.onerror = finish;
       speechSynthesis.speak(u);
-      setTimeout(finish, 20000); // 兜底
+      timer = setTimeout(finish, 20000); // 兜底
     } catch (e) { resolve(); }
   });
 }
 
-/* 共享：请求豆包 TTS，返回音频 Blob */
-async function fetchTTSBlob(clean) {
+/* 共享：请求豆包 TTS，返回音频 Blob（signal 可选，用于取消在途的预取请求） */
+async function fetchTTSBlob(clean, signal) {
   const res = await axios.post(
     "/api/tts",
     { text: clean, voice: voicePersona },
-    { responseType: "blob", timeout: 30000 }
+    { responseType: "blob", timeout: 30000, signal }
   );
   return res.data;
+}
+
+/* 共享：上传 WAV 做语音识别，返回识别文本（失败抛错） */
+async function transcribeWav(wavBlob) {
+  const res = await axios.post("/api/asr?format=wav", wavBlob, {
+    headers: { "Content-Type": "application/octet-stream" },
+    timeout: 30000,
+  });
+  return ((res.data && res.data.text) || "").trim();
 }
 
 /* 共享：播放音频 Blob（主聊天与通话共用 currentAudio 句柄） */
@@ -325,9 +349,11 @@ function playAudioBlob(blob) {
     let done = false;
     let url = null;
     let audio = null;
+    let timer = null;
     const finish = () => {
       if (done) return;
       done = true;
+      if (timer) clearTimeout(timer);
       if (currentAudio && currentAudio.audio === audio) currentAudio = null;
       if (url) { try { URL.revokeObjectURL(url); } catch (e) {} }
       resolve();
@@ -340,67 +366,98 @@ function playAudioBlob(blob) {
       audio.onerror = finish;
       const p = audio.play();
       if (p && p.catch) p.catch(finish);
-      setTimeout(finish, 120000); // 绝对兜底
+      timer = setTimeout(finish, 120000); // 绝对兜底
     } catch (e) { finish(); }
   });
 }
 
-/* ============ 主聊天分句朗读：边流式边合成播放，不等全文 ============ */
-/* 旧逻辑等整条回复生成完再整段合成，文字先出、语音要再等两三秒；
-   现在第一句一到就开口，且当前句播放时预取下一句，句间零停顿。 */
-let chatSpeechQueue = [];
-let chatSpeechBusy = false;
-let chatSpeechPrefetch = null; // { text, promise }
-let chatSpeechGen = 0;         // 重置代次：打断后丢弃在途请求的播放
+/* ============ 分句朗读播放队列（主聊天与通话共用一套引擎） ============ */
+/* 第一句一到就开口，当前句播放时预取下一句，句间零停顿。
+   opts:
+     canSpeak()  —— 是否继续播放（关语音 / 通话挂断时返回 false）
+     onSpeak()   —— 每句开始播放前回调（通话模式用它切换「正在说话」状态）
+     onDrained() —— 队列排空时回调（通话模式用于播完自动回到聆听状态） */
+function createSpeechQueue(opts = {}) {
+  const canSpeak = opts.canSpeak || (() => true);
+  const onSpeak = opts.onSpeak || (() => {});
+  const onDrained = opts.onDrained || (() => {});
+  let queue = [];
+  let busy = false;
+  let prefetch = null; // { text, promise, abort } 预取的下一句音频（可中途取消）
+  let gen = 0;         // 重置代次：打断后丢弃在途请求的播放
 
-function chatSpeechReset() {
-  chatSpeechGen++;
-  chatSpeechQueue = [];
-  chatSpeechPrefetch = null;
-  stopAudio();
-}
-
-function chatSpeechEnqueue(sentences) {
-  if (!voiceEnabled || !sentences || !sentences.length) return;
-  chatSpeechQueue.push(...sentences);
-  pumpChatSpeech();
-}
-
-async function pumpChatSpeech() {
-  if (!voiceEnabled || chatSpeechBusy) return;
-  const sentence = chatSpeechQueue.shift();
-  if (!sentence) return;
-  const gen = chatSpeechGen;
-  chatSpeechBusy = true;
-  let clean = "";
-  try {
-    clean = textForSpeech(sentence);
-    if (clean) {
-      let blobPromise;
-      if (chatSpeechPrefetch && chatSpeechPrefetch.text === clean) {
-        blobPromise = chatSpeechPrefetch.promise; // 命中预取，直接播放
-        chatSpeechPrefetch = null;
-      } else {
-        blobPromise = fetchTTSBlob(clean);
-      }
-      // 当前句播放期间预取下一句的音频，消除句间停顿
-      const nextClean = textForSpeech(chatSpeechQueue[0] || "");
-      chatSpeechPrefetch = nextClean
-        ? { text: nextClean, promise: fetchTTSBlob(nextClean).catch(() => null) }
-        : null;
-      const blob = await blobPromise;
-      if (gen !== chatSpeechGen) return; // 已被打断（新消息/停止/关语音）
-      if (!blob || (blob.size != null && blob.size === 0)) throw new Error("empty audio");
-      await playAudioBlob(blob);
-    }
-  } catch (e) {
-    chatSpeechPrefetch = null;
-    if (gen === chatSpeechGen && voiceEnabled && clean) await speakFallback(clean);
-  } finally {
-    chatSpeechBusy = false;
+  function abortPrefetch() {
+    if (prefetch && prefetch.abort) { try { prefetch.abort(); } catch (e) {} }
+    prefetch = null;
   }
-  if (gen === chatSpeechGen) pumpChatSpeech();
+
+  /* 打断：清空未播放的句子并取消在途预取（当前正在播放的一句由代次/canSpeak 兜住） */
+  function cancelPending() {
+    gen++;
+    queue = [];
+    abortPrefetch();
+  }
+
+  /* 彻底重置：打断 + 立即停止当前正在播放的音频 */
+  function reset() {
+    cancelPending();
+    stopAudio();
+  }
+
+  function enqueue(list) {
+    if (!list || !list.length || !canSpeak()) return;
+    queue.push(...list);
+    pump();
+  }
+
+  async function pump() {
+    if (busy || !canSpeak()) return;
+    const sentence = queue.shift();
+    if (sentence == null) {
+      onDrained();
+      return;
+    }
+    const g = gen;
+    busy = true;
+    let clean = "";
+    try {
+      onSpeak();
+      clean = textForSpeech(sentence);
+      if (clean) {
+        let blobPromise;
+        if (prefetch && prefetch.text === clean) {
+          blobPromise = prefetch.promise; // 命中预取，直接播放
+          prefetch = null;
+        } else {
+          blobPromise = fetchTTSBlob(clean);
+        }
+        // 当前句播放期间预取下一句的音频，消除句间停顿；打断时一并取消预取请求
+        const nextClean = textForSpeech(queue[0] || "");
+        const ac = nextClean ? new AbortController() : null;
+        prefetch = nextClean
+          ? { text: nextClean, promise: fetchTTSBlob(nextClean, ac.signal).catch(() => null), abort: () => ac.abort() }
+          : null;
+        const blob = await blobPromise;
+        if (g !== gen || !canSpeak()) return; // 已被打断（新消息/停止/关语音/挂断）
+        if (!blob || (blob.size != null && blob.size === 0)) throw new Error("empty audio");
+        await playAudioBlob(blob);
+      }
+    } catch (e) {
+      abortPrefetch();
+      if (g === gen && canSpeak() && clean) await speakFallback(clean);
+    } finally {
+      busy = false;
+    }
+    if (g === gen && canSpeak()) pump();
+  }
+
+  return { enqueue, pump, cancelPending, reset, isBusy: () => busy };
 }
+
+/* 主聊天朗读队列：语音开关关闭即停 */
+const chatSpeech = createSpeechQueue({
+  canSpeak: () => voiceEnabled,
+});
 
 function updateVoiceUI() {
   voiceBtn.classList.toggle("is-on", voiceEnabled);
@@ -484,14 +541,16 @@ function _encodeWav(samples, sampleRate) {
   return new Blob([view], { type: "audio/wav" });
 }
 
-/* 选一个浏览器支持的录制格式（语音输入与通话共用） */
+/* 选一个浏览器支持的录制格式（语音输入与通话共用；探测结果记忆化，避免每次录音重复探测） */
+let _recorderMime = null;
 function pickRecorderMime() {
-  if (typeof MediaRecorder === "undefined") return "";
+  if (_recorderMime !== null) return _recorderMime;
+  if (typeof MediaRecorder === "undefined") return (_recorderMime = "");
   const candidates = ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"];
   for (const c of candidates) {
-    if (MediaRecorder.isTypeSupported(c)) return c;
+    if (MediaRecorder.isTypeSupported(c)) return (_recorderMime = c);
   }
-  return "";
+  return (_recorderMime = "");
 }
 
 async function startRecording() {
@@ -607,11 +666,7 @@ async function transcribeAndSend(blob) {
   micBtn.disabled = true;
   micBtn.classList.add("is-transcribing");
   try {
-    const res = await axios.post("/api/asr?format=wav", blob, {
-      headers: { "Content-Type": "application/octet-stream" },
-      timeout: 30000,
-    });
-    const text = ((res.data && res.data.text) || "").trim();
+    const text = await transcribeWav(blob);
     if (text) {
       inputEl.value = text;
       autoResize();
@@ -620,11 +675,7 @@ async function transcribeAndSend(blob) {
       _flashPlaceholder("没听清，再说一遍？", 2000);
     }
   } catch (e) {
-    const msg =
-      (e.response && e.response.data && e.response.data.error) ||
-      e.message ||
-      "识别失败";
-    _flashPlaceholder(`语音识别失败：${msg}`, 3000);
+    _flashPlaceholder(`语音识别失败：${apiErrorText(e, "识别失败")}`, 3000);
   } finally {
     micBtn.disabled = false;
     micBtn.classList.remove("is-transcribing");
@@ -665,12 +716,12 @@ let weatherShort = "";   // 短描述（侧边栏 chip 展示用）
 let locBusy = false;
 
 function renderLocation() {
-  if (locationInfo && locationInfo.city && weatherShort) {
-    locationChip.textContent = `📍 ${locationInfo.city} · ${weatherShort}`;
-  } else if (locationInfo && locationInfo.city) {
-    locationChip.textContent = `📍 ${locationInfo.city}`;
-  } else if (locationInfo && weatherShort) {
-    locationChip.textContent = `📍 ${weatherShort}`;
+  const city = locationInfo && locationInfo.city;
+  if (city || weatherShort) {
+    const parts = [];
+    if (city) parts.push(city);
+    if (weatherShort) parts.push(weatherShort);
+    locationChip.textContent = `📍 ${parts.join(" · ")}`;
   } else {
     locationChip.textContent = "📍 设置城市";
   }
@@ -680,6 +731,17 @@ function saveLocationLocal() {
   try {
     localStorage.setItem(STORAGE_KEYS.location, JSON.stringify(locationInfo));
   } catch (e) { /* 存储不可用时静默降级 */ }
+}
+
+/* 天气定时刷新：由后端返回的 refresh_after 驱动（缓存 TTL 的唯一时间来源），
+   替代前端硬编码的固定间隔，避免与后端缓存节奏脱节 */
+let weatherRefreshTimer = null;
+function scheduleWeatherRefresh(seconds) {
+  clearTimeout(weatherRefreshTimer);
+  weatherRefreshTimer = setTimeout(() => {
+    weatherRefreshTimer = null;
+    if (locationInfo) fetchWeather();
+  }, (seconds || 600) * 1000);
 }
 
 /* 查询天气并更新展示；locationInfo 决定用坐标还是城市名请求 */
@@ -708,6 +770,7 @@ async function fetchWeather() {
     weatherShort = d.short || "";
     saveLocationLocal();
     renderLocation();
+    scheduleWeatherRefresh(d.refresh_after);
     return true;
   } catch (e) {
     return false;
@@ -786,6 +849,7 @@ async function saveManualCity() {
     weatherShort = d.short || "";
     saveLocationLocal();
     renderLocation();
+    scheduleWeatherRefresh(d.refresh_after);
     locationStatusEl.textContent = "";
     locationEditorEl.classList.add("hidden");
   } catch (e) {
@@ -800,9 +864,8 @@ async function saveManualCity() {
   }
 }
 
-/* 初始化定位：有缓存先用缓存，否则自动定位；之后每 10 分钟刷新天气。
-   可安全重复调用（登录成功后会补跑一次），定时器只注册一份 */
-let locationTimerStarted = false;
+/* 初始化定位：有缓存先用缓存，否则自动定位。
+   可安全重复调用（登录成功后会补跑一次）；天气刷新由 scheduleWeatherRefresh 驱动 */
 async function initLocation() {
   const saved = localStorage.getItem(STORAGE_KEYS.location);
   if (saved) {
@@ -816,10 +879,6 @@ async function initLocation() {
     fetchWeather();
   } else if (!locBusy) {
     detectLocation();
-  }
-  if (!locationTimerStarted) {
-    locationTimerStarted = true;
-    setInterval(() => { if (locationInfo) fetchWeather(); }, 10 * 60 * 1000);
   }
 }
 
@@ -850,6 +909,22 @@ function locationPayload() {
   return null;
 }
 
+/* 组装 /api/chat 请求体：名字/性格/开场白上下文/位置等公共字段在这里统一维护，
+   四处调用方（聊天/开场白/通话/通话问候）只传各自不同的部分 */
+function buildChatPayload({ messages, greeting = false, call = false } = {}) {
+  const payload = {
+    messages,
+    name: gfName,
+    personality: gfPersonality,
+  };
+  if (greeting) payload.greeting = true;
+  if (call) payload.call = true;
+  if (greetingText) payload.greeting_text = greetingText;
+  const loc = locationPayload();
+  if (loc) payload.location = loc;
+  return payload;
+}
+
 /* ============ 语音通话 ============ */
 /* 类似豆包的通话模式：全屏通话界面 + 浏览器端静音检测（VAD）自动断句。
    对话循环：录音 → ASR 识别 → 大模型（通话模式，回复短而口语）→ 分句 TTS 边生成边播 → 继续聆听。
@@ -867,6 +942,7 @@ let callMuted = false;
 let callMicStream = null;
 let callAudioCtx = null;
 let callAnalyser = null;
+let callVadBuf = null;   // VAD 音量分析的复用缓冲区（避免每 100ms 分配一次）
 let callVadTimer = null;
 let callRecorder = null;
 let callChunks = [];
@@ -878,10 +954,24 @@ let callStartTs = 0;
 let callTimerInterval = null;
 let callController = null;
 let callStreamDone = true;
-let callSentenceQueue = [];
-let callTtsBusy = false;
-let callTtsPrefetch = null; // { text, promise } 预取的下一句音频
 let callStatusTimer = null;
+
+/* 通话朗读队列：挂断即停；播完排空后自动回到聆听状态 */
+const callSpeech = createSpeechQueue({
+  canSpeak: () => callActive,
+  onSpeak: () => setCallState("speaking", "正在说话…"),
+  onDrained: () => { if (callStreamDone && callActive) startListening(); },
+});
+
+/* 各通话状态的默认状态栏文案（setCallState 省略 statusText 时与 flashCallStatus 恢复时共用） */
+const CALL_STATUS_TEXT = {
+  connecting: "正在连接…",
+  listening: "正在聆听…",
+  recognizing: "正在识别…",
+  thinking: "思考中…",
+  speaking: "正在说话…",
+  muted: "已静音",
+};
 
 function callVadThreshold() {
   return Math.min(CALL_VAD_MAX, Math.max(CALL_VAD_MIN, callNoiseFloor * 3));
@@ -889,6 +979,7 @@ function callVadThreshold() {
 
 function setCallState(state, statusText) {
   callState = state;
+  if (statusText === undefined) statusText = CALL_STATUS_TEXT[state] || "";
   if (statusText != null) callStatusEl.textContent = statusText;
   callAvatarWrapEl.classList.toggle("is-speaking", state === "speaking");
   callAvatarWrapEl.classList.toggle("is-listening", state === "listening");
@@ -899,15 +990,7 @@ function flashCallStatus(msg, ms = 2000) {
   callStatusEl.textContent = msg;
   clearTimeout(callStatusTimer);
   callStatusTimer = setTimeout(() => {
-    const map = {
-      connecting: "正在连接…",
-      listening: "正在聆听…",
-      recognizing: "正在识别…",
-      thinking: "思考中…",
-      speaking: "正在说话…",
-      muted: "已静音",
-    };
-    if (map[callState]) callStatusEl.textContent = map[callState];
+    if (CALL_STATUS_TEXT[callState]) callStatusEl.textContent = CALL_STATUS_TEXT[callState];
   }, ms);
 }
 
@@ -941,12 +1024,10 @@ async function startCall() {
   callMuted = false;
   callMuteBtn.classList.remove("is-muted");
   callMuteBtn.title = "静音";
-  callSentenceQueue = [];
-  callTtsBusy = false;
-  callTtsPrefetch = null;
+  callSpeech.cancelPending(); // 清空通话朗读队列并取消在途预取
   callStreamDone = true;
   callNoiseFloor = 0.004;
-  chatSpeechReset(); // 清空主聊天的朗读队列并停止播放，避免抢音频
+  chatSpeech.reset(); // 清空主聊天的朗读队列并停止播放，避免抢音频
 
   callOverlayEl.classList.remove("hidden");
   callTranscriptEl.innerHTML = "";
@@ -999,9 +1080,7 @@ function endCall() {
     try { callController.abort(); } catch (e) { /* 忽略 */ }
   }
   callController = null;
-  callSentenceQueue = [];
-  callTtsBusy = false;
-  callTtsPrefetch = null;
+  callSpeech.cancelPending();
   stopCallAudio();
   if (callVadTimer) { clearInterval(callVadTimer); callVadTimer = null; }
   if (callTimerInterval) { clearInterval(callTimerInterval); callTimerInterval = null; }
@@ -1028,7 +1107,7 @@ function endCall() {
 /* ============ 聆听与静音检测（VAD） ============ */
 function startListening() {
   if (!callActive || callState === "listening") return;
-  if (currentAudio || callTtsBusy) return; // 她还在说话，等音频播完（由排空事件触发）
+  if (currentAudio || callSpeech.isBusy()) return; // 她还在说话，等音频播完（由排空事件触发）
   if (callMuted) {
     setCallState("muted", "已静音");
     return;
@@ -1042,11 +1121,11 @@ function startListening() {
 
 function callRms() {
   if (!callAnalyser) return 0;
-  const buf = new Float32Array(callAnalyser.fftSize);
-  callAnalyser.getFloatTimeDomainData(buf);
+  if (!callVadBuf) callVadBuf = new Float32Array(callAnalyser.fftSize); // 复用缓冲区，不在音频热路径上反复分配
+  callAnalyser.getFloatTimeDomainData(callVadBuf);
   let sum = 0;
-  for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-  return Math.sqrt(sum / buf.length);
+  for (let i = 0; i < callVadBuf.length; i++) sum += callVadBuf[i] * callVadBuf[i];
+  return Math.sqrt(sum / callVadBuf.length);
 }
 
 function vadTick() {
@@ -1092,10 +1171,16 @@ function startCallRecorder() {
 function stopCallRecorder(rec) {
   return new Promise((resolve) => {
     let done = false;
-    const finish = () => { if (!done) { done = true; resolve(); } };
+    let timer = null;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      resolve();
+    };
     rec.onstop = finish;
     try { rec.stop(); } catch (e) { finish(); }
-    setTimeout(finish, 2000); // 兜底
+    timer = setTimeout(finish, 2000); // 兜底
   });
 }
 
@@ -1124,11 +1209,7 @@ async function stopUtterance(discard = false) {
       startListening(); // 误触发 / 纯噪声，继续聆听
       return;
     }
-    const res = await axios.post("/api/asr?format=wav", wavBlob, {
-      headers: { "Content-Type": "application/octet-stream" },
-      timeout: 30000,
-    });
-    const text = ((res.data && res.data.text) || "").trim();
+    const text = await transcribeWav(wavBlob);
     if (!text) {
       flashCallStatus("没听清，再说说？");
       startListening();
@@ -1136,10 +1217,7 @@ async function stopUtterance(discard = false) {
     }
     await handleCallTurn(text);
   } catch (e) {
-    const msg =
-      (e.response && e.response.data && e.response.data.error) ||
-      e.message || "识别失败";
-    flashCallStatus(`语音识别失败：${msg}`, 3000);
+    flashCallStatus(`语音识别失败：${apiErrorText(e, "识别失败")}`, 3000);
     if (callActive) startListening();
   }
 }
@@ -1150,31 +1228,12 @@ async function handleCallTurn(text) {
   addUserMessage(text); // 同步写入主聊天界面，挂断后可见
   history.push({ role: "user", content: text });
 
-  const payload = {
-    messages: history.slice(),
-    name: gfName,
-    personality: gfPersonality,
-    call: true,
-  };
-  if (greetingText) payload.greeting_text = greetingText;
-  const loc = locationPayload();
-  if (loc) payload.location = loc;
-
-  await runCallReply(payload);
+  await runCallReply(buildChatPayload({ messages: history.slice(), call: true }));
 }
 
 async function callGreeting() {
   if (!callActive) return;
-  const payload = {
-    greeting: true,
-    messages: [],
-    name: gfName,
-    personality: gfPersonality,
-    call: true,
-  };
-  const loc = locationPayload();
-  if (loc) payload.location = loc;
-  await runCallReply(payload, { greeting: true }); // 字幕由 runCallReply 内部渲染
+  await runCallReply(buildChatPayload({ messages: [], greeting: true, call: true }), { greeting: true }); // 字幕由 runCallReply 内部渲染
 }
 
 /* 把流式文本按句切分：返回 { out: 完整句子列表, rest: 未成句的尾巴 } */
@@ -1197,11 +1256,48 @@ function extractSentences(buffer, flush = false) {
   return { out, rest };
 }
 
+/* 共享流式核心（主聊天与通话共用）：
+   POST /api/chat 增量接收全文，全文变长时回调 onText(full)，
+   每切分出完整句子回调 onSentence(list)，正常结束后回调 onDone(tail, full)。
+   返回 { text: 最终全文, canceled, err }；取消/失败的标记文案由调用方追加。 */
+async function streamChat(payload, { signal, onText, onSentence, onDone } = {}) {
+  let acc = "";
+  let pending = "";
+  const ingest = (full) => {
+    if (!full || full.length <= acc.length) return;
+    pending += full.slice(acc.length);
+    acc = full;
+    if (onText) onText(full);
+    if (onSentence) {
+      const { out, rest } = extractSentences(pending);
+      pending = rest;
+      if (out.length) onSentence(out);
+    }
+  };
+  let canceled = false;
+  let err = null;
+  try {
+    const res = await axios.post("/api/chat", payload, {
+      responseType: "text",
+      signal,
+      onDownloadProgress: (e) => {
+        const xhr = (e && (e.currentTarget || e.target)) || null;
+        ingest((xhr && (xhr.responseText != null ? xhr.responseText : xhr.response)) || "");
+      },
+    });
+    ingest(res.data || ""); // 收尾：接收最后可能缺的部分
+    if (onDone) onDone(pending, acc);
+    pending = "";
+  } catch (e) {
+    canceled = axios.isCancel(e) || (e && e.code === "ERR_CANCELED");
+    err = e;
+  }
+  return { text: acc, canceled, err };
+}
+
 /* 流式获取她的回复：边流式接收边分句送 TTS 队列播放 */
 async function runCallReply(payload, opts = {}) {
   const isGreeting = !!opts.greeting;
-  let acc = "";
-  let pending = "";
   let chatBubble = null;
   const transcriptBubble = addCallBubble("assistant", "");
 
@@ -1214,56 +1310,32 @@ async function runCallReply(payload, opts = {}) {
   callController = new AbortController();
   setCallState("thinking", "思考中…");
 
-  const pushText = (full) => {
-    acc = full;
-    if (chatBubble) updateBubble(chatBubble, acc);
-    transcriptBubble.innerHTML = renderMarkdown(acc);
-    callTranscriptEl.scrollTop = callTranscriptEl.scrollHeight;
-  };
+  const { text: acc, canceled, err } = await streamChat(payload, {
+    signal: callController.signal,
+    onText: (full) => {
+      if (chatBubble) updateBubble(chatBubble, full);
+      // 字幕流式期间用纯文本即可（避免每个分片全量重渲染 Markdown），结束后统一渲染
+      transcriptBubble.textContent = full;
+      callTranscriptEl.scrollTop = callTranscriptEl.scrollHeight;
+    },
+    onSentence: (out) => callSpeech.enqueue(out),
+    onDone: (tail) => {
+      if (tail.trim()) callSpeech.enqueue([tail.trim()]);
+    },
+  });
 
-  try {
-    const res = await axios.post("/api/chat", payload, {
-      responseType: "text",
-      signal: callController.signal,
-      onDownloadProgress: (e) => {
-        const xhr = (e && (e.currentTarget || e.target)) || null;
-        const full = ((xhr && xhr.responseText != null ? xhr.responseText : xhr && xhr.response) || "");
-        if (full.length > acc.length) {
-          pending += full.slice(acc.length);
-          pushText(full);
-          const { out, rest } = extractSentences(pending);
-          pending = rest;
-          enqueueCallSentences(out);
-        }
-      },
-    });
-
-    const finalText = res.data || "";
-    if (finalText.length > acc.length) {
-      pending += finalText.slice(acc.length);
-      pushText(finalText);
-    }
-    if (pending.trim()) {
-      enqueueCallSentences([pending.trim()]);
-      pending = "";
-    }
-  } catch (err) {
-    if (axios.isCancel(err) || (err && err.code === "ERR_CANCELED")) {
-      acc += "\n\n（已停止）";
-    } else {
-      const msg =
-        (err.response && err.response.data && err.response.data.error) ||
-        err.message || "网络错误";
-      acc += `\n\n[请求失败] ${msg}`;
-      if (chatBubble) chatBubble.classList.add("bubble--error");
-    }
-    if (chatBubble) updateBubble(chatBubble, acc);
-  } finally {
-    callController = null;
-    callStreamDone = true;
-    transcriptBubble.innerHTML = renderMarkdown(acc || "（未收到回复）");
-    callTranscriptEl.scrollTop = callTranscriptEl.scrollHeight;
+  let finalText = acc;
+  if (canceled) {
+    finalText += "\n\n（已停止）";
+  } else if (err) {
+    finalText += `\n\n[请求失败] ${apiErrorText(err, "网络错误")}`;
+    if (chatBubble) chatBubble.classList.add("bubble--error");
   }
+  if (chatBubble) updateBubble(chatBubble, finalText);
+  callController = null;
+  callStreamDone = true;
+  transcriptBubble.innerHTML = renderMarkdown(finalText || "（未收到回复）");
+  callTranscriptEl.scrollTop = callTranscriptEl.scrollHeight;
 
   if (!isGreeting && acc.trim()) {
     history.push({ role: "assistant", content: acc });
@@ -1272,62 +1344,8 @@ async function runCallReply(payload, opts = {}) {
     chatBubble.parentNode.removeChild(chatBubble); // 空回复不留在主聊天
   }
 
-  pumpCallTTS(); // 若音频队列已空则立即收尾，否则播完后触发
+  callSpeech.pump(); // 若音频队列已空则立即收尾，否则播完后触发
   return acc;
-}
-
-/* ============ 分句 TTS 播放队列 ============ */
-function enqueueCallSentences(list) {
-  if (!list.length || !callActive) return;
-  callSentenceQueue.push(...list);
-  pumpCallTTS();
-}
-
-async function pumpCallTTS() {
-  if (!callActive || callTtsBusy) return;
-  const sentence = callSentenceQueue.shift();
-  if (!sentence) {
-    if (callStreamDone) onCallReplyAudioDone();
-    return;
-  }
-  callTtsBusy = true;
-  await speakCallSentence(sentence);
-  callTtsBusy = false;
-  if (callActive) pumpCallTTS();
-}
-
-function onCallReplyAudioDone() {
-  if (!callActive) return;
-  startListening(); // 内部有幂等保护
-}
-
-async function speakCallSentence(text) {
-  if (!callActive) return;
-  setCallState("speaking", "正在说话…");
-  const clean = textForSpeech(text);
-  if (!clean) return;
-  try {
-    let blobPromise;
-    if (callTtsPrefetch && callTtsPrefetch.text === clean) {
-      blobPromise = callTtsPrefetch.promise; // 命中预取，直接播放
-      callTtsPrefetch = null;
-    } else {
-      blobPromise = fetchTTSBlob(clean);
-    }
-    // 当前句播放期间预取下一句的音频，消除句间停顿
-    const nextClean = textForSpeech(callSentenceQueue[0] || "");
-    callTtsPrefetch = nextClean
-      ? { text: nextClean, promise: fetchTTSBlob(nextClean).catch(() => null) }
-      : null;
-    const blob = await blobPromise;
-    if (!callActive) return; // 等待期间已挂断，不再播放
-    if (!blob || (blob.size != null && blob.size === 0)) throw new Error("empty audio");
-    await playAudioBlob(blob);
-  } catch (e) {
-    if (!callActive) return;
-    callTtsPrefetch = null;
-    await speakFallback(clean); // 网络合成失败时退回浏览器语音
-  }
 }
 
 function stopCallAudio() {
@@ -1344,7 +1362,7 @@ callMuteBtn.addEventListener("click", () => {
   if (callMuted) {
     if (callState === "listening") stopUtterance(true);
     setCallState("muted", "已静音");
-  } else if (currentAudio || callTtsBusy) {
+  } else if (currentAudio || callSpeech.isBusy()) {
     // 她还在说话：先显示说话状态，等音频播完由排空事件自动进入聆听
     setCallState("speaking", "正在说话…");
   } else {
@@ -1364,74 +1382,43 @@ callBtnHeader.addEventListener("click", () => {
 /* opts.speech: 开启后边流式接收边分句朗读（第一句一到就开口，不等全文） */
 async function streamReply(payload, opts = {}) {
   const bubble = addAssistantPlaceholder();
-  let acc = "";
-  let pending = "";
-  let spokenUpTo = 0;
   const speechOn = !!(opts.speech && voiceEnabled);
   isStreaming = true;
   controller = new AbortController();
   setStreamingUI(true);
 
-  try {
-    const res = await axios.post("/api/chat", payload, {
-      responseType: "text",
-      signal: controller.signal,
-      onDownloadProgress: (e) => {
-        const xhr = (e && (e.currentTarget || e.target)) || null;
-        const full = ((xhr && xhr.responseText != null ? xhr.responseText : xhr && xhr.response) || "");
-        if (full.length > acc.length) {
-          acc = full;
-          updateBubble(bubble, acc);
-          scrollToBottom();
-          if (speechOn) {
-            pending += full.slice(spokenUpTo);
-            spokenUpTo = full.length;
-            const { out, rest } = extractSentences(pending);
-            pending = rest;
-            chatSpeechEnqueue(out);
-          }
-        }
-      },
-    });
-
-    const finalText = res.data || "";
-    if (finalText !== acc) {
-      acc = finalText;
-      updateBubble(bubble, acc);
-    }
-    if (speechOn) {
+  const { text: acc, canceled, err } = await streamChat(payload, {
+    signal: controller.signal,
+    onText: (full) => {
+      updateBubble(bubble, full);
+      scrollToBottom();
+    },
+    onSentence: speechOn ? (out) => chatSpeech.enqueue(out) : null,
+    onDone: (tail, full) => {
       // 把最后没成句的尾巴也排入朗读（错误/停止提示不读）
-      pending += finalText.slice(Math.min(spokenUpTo, finalText.length));
-      if (!/\[请求失败\]|\[错误\]|（已停止）/.test(finalText)) {
-        const { out } = extractSentences(pending, true);
-        chatSpeechEnqueue(out);
+      if (speechOn && !/\[请求失败\]|\[错误\]|（已停止）/.test(full)) {
+        const { out } = extractSentences(tail, true);
+        chatSpeech.enqueue(out);
       }
-    }
-  } catch (err) {
-    if (axios.isCancel(err) || (err && err.code === "ERR_CANCELED")) {
-      chatSpeechReset(); // 用户停止：打断朗读
-      acc += "\n\n_（已停止）_";
-      updateBubble(bubble, acc);
-    } else {
-      chatSpeechQueue = [];
-      chatSpeechPrefetch = null;
-      chatSpeechGen++;
-      const msg =
-        (err.response && err.response.data && err.response.data.error) ||
-        err.message ||
-        "网络错误";
-      acc += `\n\n[请求失败] ${msg}`;
-      bubble.classList.add("bubble--error");
-      updateBubble(bubble, acc);
-    }
-  } finally {
-    isStreaming = false;
-    controller = null;
-    setStreamingUI(false);
-    scrollToBottom();
-  }
+    },
+  });
 
-  return acc;
+  let finalText = acc;
+  if (canceled) {
+    chatSpeech.reset(); // 用户停止：打断朗读
+    finalText += "\n\n_（已停止）_";
+  } else if (err) {
+    chatSpeech.cancelPending(); // 请求失败：丢弃未播放的句子（保留当前音频）
+    finalText += `\n\n[请求失败] ${apiErrorText(err, "网络错误")}`;
+    bubble.classList.add("bubble--error");
+  }
+  updateBubble(bubble, finalText);
+
+  isStreaming = false;
+  controller = null;
+  setStreamingUI(false);
+  scrollToBottom();
+  return finalText;
 }
 
 /* ============ 发送消息 ============ */
@@ -1448,17 +1435,8 @@ async function sendMessage(userText) {
   inputEl.value = "";
   autoResize();
 
-  const payload = {
-    messages: history.slice(),
-    name: gfName,
-    personality: gfPersonality,
-  };
-  if (greetingText) payload.greeting_text = greetingText;
-  const loc = locationPayload();
-  if (loc) payload.location = loc;
-
-  chatSpeechReset(); // 新消息打断上一条回复的朗读
-  const reply = await streamReply(payload, { speech: true });
+  chatSpeech.reset(); // 新消息打断上一条回复的朗读
+  const reply = await streamReply(buildChatPayload({ messages: history.slice() }), { speech: true });
   if (reply.trim()) {
     history.push({ role: "assistant", content: reply });
     saveState();
@@ -1469,16 +1447,8 @@ async function sendMessage(userText) {
 async function startGreeting() {
   // 开场白仅作展示，不写入 history（避免后续请求以 assistant 开头导致 API 报错）；
   // 通过 greeting_text 作为上下文传给后端，保证模型知道自己说过什么
-  const payload = {
-    greeting: true,
-    messages: [],
-    name: gfName,
-    personality: gfPersonality,
-  };
-  const loc = locationPayload();
-  if (loc) payload.location = loc;
-  chatSpeechReset();
-  const reply = await streamReply(payload, { speech: true });
+  chatSpeech.reset();
+  const reply = await streamReply(buildChatPayload({ messages: [], greeting: true }), { speech: true });
   if (reply.trim()) {
     greetingText = reply;
     saveState();
@@ -1568,7 +1538,7 @@ voiceBtn.addEventListener("click", () => {
   voiceEnabled = !voiceEnabled;
   if (!voiceEnabled) {
     if ("speechSynthesis" in window) speechSynthesis.cancel();
-    chatSpeechReset(); // 停止当前朗读并清空队列
+    chatSpeech.reset(); // 停止当前朗读并清空队列
   }
   localStorage.setItem(STORAGE_KEYS.voice, voiceEnabled ? "1" : "0");
   updateVoiceUI();
@@ -1626,9 +1596,7 @@ async function doLogin() {
     loginOverlayEl.classList.add("hidden");
     loginPasswordEl.value = "";
     loginErrorEl.textContent = "";
-    // 登录前页面初始化的请求（音色列表/定位）会因 401 失败，登录后补拉一次
-    if (!voicePersonas.length) loadVoicePersonas();
-    initLocation();
+    bootstrapAfterAuth(); // 登录成功后补拉需要鉴权的初始化数据
   } catch (e) {
     loginErrorEl.textContent = "密码错误，请重试";
   } finally {
@@ -1642,10 +1610,18 @@ loginPasswordEl.addEventListener("keydown", (e) => {
 });
 
 /* ============ 初始化 ============ */
-(function init() {
-  // 登录态检查：未登录则弹密码框
+/* 登录态就绪后拉取需要鉴权的初始化数据（音色列表 + 定位/天气）；
+   已登录时由 init 直接调用，未登录时由 doLogin 成功后调用，避免发出注定 401 的请求 */
+function bootstrapAfterAuth() {
+  if (!voicePersonas.length) loadVoicePersonas();
+  initLocation();
+}
+
+(async function init() {
+  // 登录态检查：未登录则弹密码框；已登录则立即拉取鉴权数据
   checkAuth().then((authed) => {
     if (!authed) loginOverlayEl.classList.remove("hidden");
+    else bootstrapAfterAuth();
   });
 
   const savedName = localStorage.getItem(STORAGE_KEYS.name) || "";
@@ -1688,9 +1664,6 @@ loginPasswordEl.addEventListener("keydown", (e) => {
   voicePersona = localStorage.getItem(STORAGE_KEYS.voicePersona) || "gentle";
   initVoices();
   updateVoiceUI();
-  loadVoicePersonas();
-
-  initLocation();
 
   fetchModelBadge();
 

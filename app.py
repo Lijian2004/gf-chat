@@ -20,6 +20,7 @@ import threading
 import urllib.parse
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import anthropic
@@ -75,27 +76,32 @@ _auth_token = ""
 if ACCESS_PASSWORD:
     _auth_token = hashlib.sha256(("gf-chat:" + ACCESS_PASSWORD).encode("utf-8")).hexdigest()
 
-# 简单内存缓存：相同「音色+文本」不重复合成
-_tts_lock = threading.Lock()
-_tts_cache = {}
-_tts_cache_keys = []
-_TTS_CACHE_MAX = 64
+# 通用线程安全 TTL 缓存：TTS 音频、地理编码、天气、IP 定位结果共用
+_cache_lock = threading.Lock()
+_cache = {}  # key -> (过期时间戳, value)
+_CACHE_MAX = 256
 
 
-def _tts_cache_get(key):
-    with _tts_lock:
-        return _tts_cache.get(key)
+def _cache_get(key):
+    with _cache_lock:
+        item = _cache.get(key)
+        if not item:
+            return None
+        expires, value = item
+        if time.time() >= expires:
+            return None  # 过期（懒失效，等下次写入时清理）
+        return value
 
 
-def _tts_cache_put(key, data):
-    with _tts_lock:
-        if key in _tts_cache:
-            return
-        _tts_cache[key] = data
-        _tts_cache_keys.append(key)
-        while len(_tts_cache_keys) > _TTS_CACHE_MAX:
-            old = _tts_cache_keys.pop(0)
-            _tts_cache.pop(old, None)
+def _cache_put(key, value, ttl, max_size=_CACHE_MAX):
+    with _cache_lock:
+        _cache[key] = (time.time() + ttl, value)
+        if len(_cache) > max_size:  # 防止缓存无限膨胀
+            now = time.time()
+            for k in [k for k, (exp, _) in _cache.items() if exp < now]:
+                _cache.pop(k, None)
+            while len(_cache) > max_size:
+                _cache.pop(next(iter(_cache)))
 
 
 def _volc_tts_synthesize(text, speaker):
@@ -221,30 +227,8 @@ GEOCODE_TTL = 24 * 60 * 60   # 「城市名 → 坐标」缓存时长
 IPLOC_TTL = 60 * 60          # 「IP → 城市」缓存时长
 GEO_TIMEOUT = 8              # 外部定位/天气接口超时（秒）
 
-_geo_lock = threading.Lock()
-_geo_cache = {}  # key -> (过期时间戳, value)
-
-
-def _cache_get(key):
-    with _geo_lock:
-        item = _geo_cache.get(key)
-        if not item:
-            return None
-        expires, value = item
-        if time.time() >= expires:
-            return None  # 过期（懒失效，等下次写入时清理）
-        return value
-
-
-def _cache_put(key, value, ttl):
-    with _geo_lock:
-        _geo_cache[key] = (time.time() + ttl, value)
-        if len(_geo_cache) > 256:  # 防止缓存无限膨胀
-            now = time.time()
-            for k in [k for k, (exp, _) in _geo_cache.items() if exp < now]:
-                _geo_cache.pop(k, None)
-            while len(_geo_cache) > 256:
-                _geo_cache.pop(next(iter(_geo_cache)))
+# 坐标反查城市与取天气并行用（/api/weather 的 lat/lon 路径）
+_GEO_POOL = ThreadPoolExecutor(max_workers=2)
 
 
 def _http_get_json(url, timeout=GEO_TIMEOUT, retries=3):
@@ -265,23 +249,23 @@ def _http_get_json(url, timeout=GEO_TIMEOUT, retries=3):
     raise last_exc
 
 
-# WMO 天气现象代码 →（中文描述, emoji）
+# WMO 天气现象代码 → 中文描述
 WMO_WEATHER = {
-    0: ("晴", "☀️"), 1: ("基本晴", "🌤️"), 2: ("多云", "⛅"), 3: ("阴", "☁️"),
-    45: ("雾", "🌫️"), 48: ("雾凇", "🌫️"),
-    51: ("小毛毛雨", "🌦️"), 53: ("毛毛雨", "🌦️"), 55: ("大毛毛雨", "🌧️"),
-    56: ("冻毛毛雨", "🌧️"), 57: ("强冻毛毛雨", "🌧️"),
-    61: ("小雨", "🌧️"), 63: ("中雨", "🌧️"), 65: ("大雨", "🌧️"),
-    66: ("冻雨", "🌧️"), 67: ("强冻雨", "🌧️"),
-    71: ("小雪", "🌨️"), 73: ("中雪", "🌨️"), 75: ("大雪", "❄️"), 77: ("雪粒", "🌨️"),
-    80: ("小阵雨", "🌦️"), 81: ("阵雨", "🌦️"), 82: ("强阵雨", "⛈️"),
-    85: ("小阵雪", "🌨️"), 86: ("大阵雪", "❄️"),
-    95: ("雷阵雨", "⛈️"), 96: ("雷阵雨伴冰雹", "⛈️"), 99: ("强雷阵雨伴冰雹", "⛈️"),
+    0: "晴", 1: "基本晴", 2: "多云", 3: "阴",
+    45: "雾", 48: "雾凇",
+    51: "小毛毛雨", 53: "毛毛雨", 55: "大毛毛雨",
+    56: "冻毛毛雨", 57: "强冻毛毛雨",
+    61: "小雨", 63: "中雨", 65: "大雨",
+    66: "冻雨", 67: "强冻雨",
+    71: "小雪", 73: "中雪", 75: "大雪", 77: "雪粒",
+    80: "小阵雨", 81: "阵雨", 82: "强阵雨",
+    85: "小阵雪", 86: "大阵雪",
+    95: "雷阵雨", 96: "雷阵雨伴冰雹", 99: "强雷阵雨伴冰雹",
 }
 
 
 def _wmo_text(code):
-    return WMO_WEATHER.get(int(code), ("天气未知", "🌡️"))
+    return WMO_WEATHER.get(int(code), "天气未知")
 
 
 def _wind_dir_text(deg):
@@ -361,7 +345,7 @@ def _fetch_weather(lat, lon):
         raise RuntimeError("天气数据为空")
     day = data.get("daily") or {}
 
-    desc, emoji = _wmo_text(cur.get("weather_code", -1))
+    desc = _wmo_text(cur.get("weather_code", -1))
     temp = round(float(cur.get("temperature_2m") or 0))
     feels = round(float(cur.get("apparent_temperature") or temp))
     humid = int(cur.get("relative_humidity_2m") or 0)
@@ -374,11 +358,11 @@ def _fetch_weather(lat, lon):
         t_max = round(float(day["temperature_2m_max"][0]))
         t_min = round(float(day["temperature_2m_min"][0]))
         text += f"；今天 {t_min}°C~{t_max}°C"
-        day_desc = _wmo_text(day.get("weather_code", [0])[0])[0]
+        day_desc = _wmo_text(day.get("weather_code", [0])[0])
         if day_desc and day_desc != desc:
             text += f"，{day_desc}"
 
-    value = {"short": short, "text": text, "emoji": emoji}
+    value = {"short": short, "text": text}
     _cache_put(key, value, WEATHER_TTL)
     return value
 
@@ -567,7 +551,7 @@ def tts():
     text = text[:TTS_MAX_LEN]
 
     cache_key = (voice_key, text)
-    cached = _tts_cache_get(cache_key)
+    cached = _cache_get(cache_key)
     if cached is not None:
         return Response(cached, mimetype="audio/mpeg")
 
@@ -576,7 +560,7 @@ def tts():
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": f"语音合成失败：{e}"}), 502
 
-    _tts_cache_put(cache_key, audio)
+    _cache_put(cache_key, audio, 24 * 60 * 60, max_size=64)
     return Response(audio, mimetype="audio/mpeg")
 
 
@@ -654,13 +638,19 @@ def weather():
     try:
         if city_param:
             city, g_lat, g_lon = _geocode_city(city_param)
+            wx = _fetch_weather(g_lat, g_lon)
         elif lat is not None and lon is not None:
             g_lat, g_lon = lat, lon
-            city = name or _reverse_geocode(g_lat, g_lon)
+            if name:
+                wx = _fetch_weather(g_lat, g_lon)
+                city = name
+            else:
+                # 反查城市与取天气互不依赖，并行执行
+                rg = _GEO_POOL.submit(_reverse_geocode, g_lat, g_lon)
+                wx = _fetch_weather(g_lat, g_lon)
+                city = rg.result()
         else:
             return jsonify({"error": "缺少 city 或 lat/lon 参数"}), 400
-
-        wx = _fetch_weather(g_lat, g_lon)
     except LookupError as e:
         return jsonify({"error": str(e)}), 404
     except Exception as e:  # noqa: BLE001
@@ -672,7 +662,7 @@ def weather():
         "lon": g_lon,
         "weather_text": wx["text"],
         "short": wx["short"],
-        "emoji": wx["emoji"],
+        "refresh_after": WEATHER_TTL,
     })
 
 
@@ -700,7 +690,7 @@ def chat():
     personality = data.get("personality")
     greeting = bool(data.get("greeting"))
     call_mode = bool(data.get("call"))
-    greeting_text = re.sub(r"[\r\n\t]+", " ", str(data.get("greeting_text") or "").strip())[:200]
+    greeting_text = _sanitize_prompt_text(data.get("greeting_text"), 200)
 
     # 位置信息（前端定位/手动设置后随请求携带）：注入 system prompt
     loc = data.get("location")
