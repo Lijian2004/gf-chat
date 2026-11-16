@@ -1,0 +1,22 @@
+/* 全局样式 */
+page {
+  background: #12101c;
+  color: #e8e5f2;
+  font-size: 30rpx;
+  font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  height: 100%;
+}
+
+/* 通用容器 */
+.page {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  box-sizing: border-box;
+}
+
+/* 主色 */
+.accent {
+  color: #a78bfa;
+}

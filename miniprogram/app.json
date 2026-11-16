@@ -1,0 +1,24 @@
+{
+  "pages": [
+    "pages/chat/chat",
+    "pages/setup/setup"
+  ],
+  "window": {
+    "navigationBarBackgroundColor": "#12101c",
+    "navigationBarTextStyle": "white",
+    "navigationBarTitleText": "AI 女友",
+    "backgroundColor": "#12101c",
+    "backgroundTextStyle": "dark"
+  },
+  "permission": {
+    "scope.userLocation": {
+      "desc": "用于获取你所在城市的实时天气，让她提醒你降温添衣"
+    },
+    "scope.record": {
+      "desc": "用于语音通话和语音输入的录音识别"
+    }
+  },
+  "requiredPrivateInfos": ["getLocation"],
+  "lazyCodeLoading": "requiredComponents",
+  "style": "v2"
+}
