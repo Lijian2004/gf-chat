@@ -168,6 +168,26 @@ function renderMarkdown(md) {
   return text.replace(/\n/g, "<br>");
 }
 
+/* 每 interval 至多执行一次；被跳过的调用在末尾补一次（保证最终态正确渲染） */
+function throttle(fn, interval = 80) {
+  let last = 0;
+  let timer = null;
+  let pendingArgs = null;
+  const run = () => {
+    last = Date.now();
+    timer = null;
+    const args = pendingArgs;
+    pendingArgs = null;
+    fn(...args);
+  };
+  return (...args) => {
+    pendingArgs = args;
+    if (!timer) {
+      timer = setTimeout(run, Math.max(0, interval - (Date.now() - last)));
+    }
+  };
+}
+
 /* 智能滚动：用户正在翻看历史时不强制拉到底部 */
 function isNearBottom() {
   return (
@@ -1331,12 +1351,12 @@ async function runCallReply(payload, opts = {}) {
 
   const { text: acc, canceled, err } = await streamChat(payload, {
     signal: callController.signal,
-    onText: (full) => {
+    onText: throttle((full) => {
       if (chatBubble) updateBubble(chatBubble, full);
       // 字幕流式期间用纯文本即可（避免每个分片全量重渲染 Markdown），结束后统一渲染
       transcriptBubble.textContent = full;
       callTranscriptEl.scrollTop = callTranscriptEl.scrollHeight;
-    },
+    }, 80),
     onSentence: (out) => callSpeech.enqueue(out),
     onDone: (tail) => {
       if (tail.trim()) callSpeech.enqueue([tail.trim()]);
@@ -1408,10 +1428,10 @@ async function streamReply(payload, opts = {}) {
 
   const { text: acc, canceled, err } = await streamChat(payload, {
     signal: controller.signal,
-    onText: (full) => {
+    onText: throttle((full) => {
       updateBubble(bubble, full);
       scrollToBottom();
-    },
+    }, 80),
     onSentence: speechOn ? (out) => chatSpeech.enqueue(out) : null,
     onDone: (tail, full) => {
       // 把最后没成句的尾巴也排入朗读（错误/停止提示不读）
@@ -1460,7 +1480,7 @@ async function sendMessage(userText) {
     history.push({ role: "assistant", content: reply });
     saveState();
   }
-  setTimeout(refreshMemoryPanel, 8000); // 后台记忆抽取完成后刷新面板
+  scheduleMemoryRefresh(); // 后台记忆抽取完成后刷新面板（防抖）
   inputEl.focus();
 }
 
@@ -1532,7 +1552,7 @@ function renderPersonas(cards) {
     <button class="personality-card${c.key === gfPersonality ? " selected" : ""}" data-personality="${escapeHtml(c.key)}" type="button">
       <span class="personality-card__emoji">${escapeHtml(c.emoji || "🎭")}</span>
       <span class="personality-card__name">${escapeHtml(c.name)}${c.custom ? " ·自建" : ""}</span>
-      <span class="personality-card__desc">${escapeHtml((c.persona || "").slice(0, 26) || c.desc || "")}</span>
+      <span class="personality-card__desc">${escapeHtml((c.persona || "").slice(0, 26))}</span>
     </button>`
     )
     .join("");
@@ -1562,15 +1582,14 @@ async function loadPersonas() {
   } catch (e) {
     personaList = initialPersonas();
   }
-  // 把自定义角色并进 PERSONALITY_META，让头像/标签等旧逻辑直接生效
+  // 服务端角色卡（预设+自定义）是唯一数据源，全部并进 PERSONALITY_META
+  // 供头像/标签等旧逻辑读取；硬编码表只作为登录前的占位渲染（initialPersonas）
   personaList.forEach((c) => {
-    if (c.custom) {
-      PERSONALITY_META[c.key] = {
-        label: c.name,
-        emoji: c.emoji || "🎭",
-        desc: (c.persona || "").slice(0, 24),
-      };
-    }
+    PERSONALITY_META[c.key] = {
+      label: c.name,
+      emoji: c.emoji || "🎭",
+      desc: (c.persona || "").slice(0, 24),
+    };
   });
   renderPersonas(personaList);
   syncPersonaSelection();
@@ -1611,16 +1630,13 @@ personaSaveBtn.addEventListener("click", async () => {
       .split("\n")
       .map((s) => s.trim())
       .filter(Boolean);
-    await axios.post("/api/personas", { key: name, name, persona, boundaries });
+    const res = await axios.post("/api/personas", { key: name, name, persona, boundaries });
     personaFormEl.classList.add("hidden");
     personaNameInput.value = "";
     personaTextEl.value = "";
     personaBoundsEl.value = "";
     await loadPersonas();
-    gfPersonality = [...name]
-      .filter((ch) => /[a-zA-Z0-9一-鿿_-]/.test(ch))
-      .join("")
-      .slice(0, 30);
+    gfPersonality = res.data.card.key; // 后端返回清洗后的 key，前端不再自行推导
     syncPersonaSelection();
     checkStartEnabled();
     personaFormStatus.textContent = "";
@@ -1754,6 +1770,15 @@ docListEl.addEventListener("click", async (e) => {
 });
 
 memoryRefreshBtn.addEventListener("click", refreshMemoryPanel);
+
+let _memoryRefreshTimer = null;
+function scheduleMemoryRefresh() {
+  clearTimeout(_memoryRefreshTimer); // 连发多条消息时只保留最后一次刷新
+  _memoryRefreshTimer = setTimeout(() => {
+    _memoryRefreshTimer = null;
+    refreshMemoryPanel();
+  }, 8000);
+}
 
 docAddBtn.addEventListener("click", () => {
   docUploadEl.classList.toggle("hidden");

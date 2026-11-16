@@ -55,22 +55,40 @@ PRESETS = {
 }
 
 _lock = threading.Lock()
+_custom_cache = None  # (mtime, {key: card})：文件级缓存，避免每次请求重读
+_custom_stamp = None
 
 
 def _load_custom():
+    global _custom_cache, _custom_stamp
     try:
-        with open(PERSONAS_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        return {c["key"]: c for c in data if isinstance(c, dict) and c.get("key")}
-    except Exception:  # noqa: BLE001
+        mtime = os.path.getmtime(PERSONAS_PATH)
+    except OSError:
         return {}
+    with _lock:
+        if _custom_cache is not None and _custom_stamp == mtime:
+            return _custom_cache
+        try:
+            with open(PERSONAS_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            cards = {c["key"]: c for c in data if isinstance(c, dict) and c.get("key")}
+        except Exception:  # noqa: BLE001
+            cards = {}
+        _custom_cache = cards
+        _custom_stamp = mtime
+        return cards
 
 
 def _save_custom(cards):
-    os.makedirs(DATA_DIR, exist_ok=True)
+    global _custom_cache, _custom_stamp
+    from agent.textproc import atomic_write_json
+    atomic_write_json(PERSONAS_PATH, list(cards.values()))
     with _lock:
-        with open(PERSONAS_PATH, "w", encoding="utf-8") as f:
-            json.dump(list(cards.values()), f, ensure_ascii=False, indent=2)
+        _custom_cache = dict(cards)
+        try:
+            _custom_stamp = os.path.getmtime(PERSONAS_PATH)
+        except OSError:
+            _custom_stamp = None
 
 
 def get_card(key):

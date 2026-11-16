@@ -91,6 +91,4 @@ def stream(messages, system, route="chat", max_tokens=8192):
             if yielded:
                 raise  # 已经发出内容，无法无缝换模型
             last_exc = e
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("没有可用模型：请检查 .env 中的 API Key 配置")
+    raise last_exc  # _chain() 保证链条非空，走到这里必有失败记录

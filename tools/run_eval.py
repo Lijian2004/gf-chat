@@ -14,9 +14,9 @@
   python tools/run_eval.py --no-lessons          # 不写教训（纯评测）
 """
 import argparse
+import concurrent.futures
 import json
 import os
-import re
 import sys
 import time
 
@@ -29,11 +29,11 @@ load_dotenv(override=True)
 from agent import memory as agent_memory  # noqa: E402
 from agent import persona as agent_persona  # noqa: E402
 from agent import router as agent_router  # noqa: E402
-from app import _load_lessons, now_text, HISTORY_LIMIT  # noqa: E402
+from agent.textproc import parse_llm_json  # noqa: E402
+from app import _load_lessons, now_text, HISTORY_LIMIT, LESSONS_PATH  # noqa: E402
 
 CASES_DIR = os.path.join(BASE, "evals", "cases")
 REPORTS_DIR = os.path.join(BASE, "evals", "reports")
-LESSONS_PATH = os.path.join(BASE, "evals", "reviews", "lessons.jsonl")
 
 JUDGE_SYSTEM = (
     "你是严格的对话质量评估员，评估一段「角色扮演 Agent」的多轮对话是否达标。"
@@ -60,11 +60,11 @@ def load_cases(category=None, filter_str=None):
 
 
 def run_case(case, lessons_block=""):
-    """回放一条用例，返回 {transcript, memory_log}。"""
+    """回放一条用例，返回 transcript。
+    prompt 组装与轮间记忆抽取均复用生产模块（build_system_prompt / extract_and_store）。"""
     space = f"eval-{case['id']}"
     store = agent_memory.MemoryStore(space)
-    store.items = []  # 重跑清空
-    store._save()
+    store.clear()
     for seed in case.get("seed_memories", []):
         store.add("preference", seed, source="seed")
 
@@ -82,13 +82,8 @@ def run_case(case, lessons_block=""):
         ).strip()
         messages.append({"role": "assistant", "content": reply})
         transcript.append({"user": turn["content"], "assistant": reply})
-        # 轮间记忆抽取（复现生产行为）
-        existing = [m["content"] for m in store.items]
-        mems = agent_memory.extract_memories(
-            turn["content"], reply, messages[-6:], existing=existing
-        )
-        if mems:
-            store.add_all(mems)
+        # 轮间记忆抽取（与生产同一步骤）
+        agent_memory.extract_and_store(store, turn["content"], reply, messages[-6:])
     return transcript
 
 
@@ -104,7 +99,8 @@ def judge_case(case, transcript):
         f"对话记录：\n{convo}\n\n评估标准：\n{rubric}\n\n输出评审 JSON："
     )
     # GLM 始终思考，思考占 token 预算：预算不足时输出为空，加倍重试一次
-    raw = ""
+    data = None
+    last_err = None
     for budget in (3000, 6000):
         raw = agent_router.chat(
             [{"role": "user", "content": prompt}],
@@ -112,13 +108,13 @@ def judge_case(case, transcript):
             route="light",
             max_tokens=budget,
         ) or ""
-        if raw.strip():
+        try:
+            data = parse_llm_json(raw, "{", "}")
             break
-    raw = re.sub(r"^```(json)?|```$", "", raw.strip(), flags=re.M).strip()
-    start, end = raw.find("{"), raw.rfind("}")
-    if start < 0 or end <= start:
-        raise ValueError(f"评审输出无法解析: {raw[:120]}")
-    data = json.loads(raw[start:end + 1])
+        except ValueError as e:
+            last_err = e
+    if data is None:
+        raise ValueError(f"评审输出无法解析: {last_err}")
     results = data.get("results") or []
     scores = [min(2, max(0, int(r.get("score", 0)))) for r in results]
     passed = bool(scores) and all(s >= 1 for s in scores) and (
@@ -165,31 +161,45 @@ def main():
     if lessons_block:
         print(f"[eval] 当前注入 {len(lessons_block.splitlines())} 条历史教训")
 
-    results = []
-    for i, case in enumerate(cases, 1):
-        print(f"\n=== [{i}/{len(cases)}] {case['id']} | {case['title']} ===", flush=True)
+    def run_one(case):
+        """回放 + 评审一条用例；返回结果对象（不直接写教训，由主线程按序写）。"""
         t0 = time.time()
         try:
             transcript = run_case(case, lessons_block)
             verdict = judge_case(case, transcript)
         except Exception as e:  # noqa: BLE001
-            print(f"  执行失败: {type(e).__name__}: {str(e)[:150]}")
-            results.append({"id": case["id"], "category": case["category"],
-                            "error": f"{type(e).__name__}: {str(e)[:200]}"})
-            continue
-        mark = "PASS" if verdict["pass"] else "FAIL"
-        print(f"  [{mark}] {'/'.join(map(str, verdict['scores']))} ({time.time() - t0:.0f}s)")
-        for d in verdict["details"]:
-            print(f"    - ({d['score']}) {d['reason'][:80]}")
-        if not verdict["pass"] and verdict["lesson"] and not args.no_lessons:
-            append_lesson(case, verdict["lesson"])
-            print(f"  [lesson] {verdict['lesson'][:80]}")
-        results.append({
+            return {"id": case["id"], "category": case["category"],
+                    "error": f"{type(e).__name__}: {str(e)[:200]}"}
+        return {
             "id": case["id"], "category": case["category"], "title": case["title"],
             "pass": verdict["pass"], "scores": verdict["scores"],
             "details": verdict["details"], "lesson": verdict["lesson"],
-            "transcript": transcript,
-        })
+            "transcript": transcript, "seconds": round(time.time() - t0, 1),
+        }
+
+    # 用例之间完全独立（各自 eval-<id> 记忆空间），小并发回放；报告按原用例顺序
+    max_workers = min(2, len(cases))
+    results = [None] * len(cases)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(run_one, case): i for i, case in enumerate(cases)}
+        done_count = 0
+        for fut in concurrent.futures.as_completed(futures):
+            idx = futures[fut]
+            case = cases[idx]
+            result = fut.result()
+            results[idx] = result
+            done_count += 1
+            if result.get("error"):
+                print(f"\n=== [{done_count}/{len(cases)}] {case['id']} ===\n  执行失败: {result['error']}", flush=True)
+                continue
+            mark = "PASS" if result["pass"] else "FAIL"
+            print(f"\n=== [{done_count}/{len(cases)}] {case['id']} | {case['title']} ===", flush=True)
+            print(f"  [{mark}] {'/'.join(map(str, result['scores']))} ({result['seconds']}s)", flush=True)
+            for d in result["details"]:
+                print(f"    - ({d['score']}) {d['reason'][:80]}", flush=True)
+            if not result["pass"] and result["lesson"] and not args.no_lessons:
+                append_lesson(cases[idx], result["lesson"])
+                print(f"  [lesson] {result['lesson'][:80]}", flush=True)
 
     passed = sum(1 for r in results if r.get("pass"))
     errored = sum(1 for r in results if r.get("error"))

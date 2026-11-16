@@ -33,14 +33,11 @@ load_dotenv(override=True)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
-MODEL = os.environ.get("MODEL", "GLM-5.3-Flash")
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8192"))
 PORT = int(os.environ.get("PORT", "5000"))
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 # 每次请求最多携带的历史消息条数（防止上下文无限膨胀、控制费用）
 HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "24"))
-# 调用上游 API 的超时时间（秒）
-REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "60"))
 
 # 模型调用统一走 agent/router.py（多模型路由：DeepSeek 主力 + GLM 轻任务 + 故障回退）
 
@@ -615,12 +612,27 @@ def _valid_messages(messages):
     return True
 
 
+LESSONS_PATH = os.path.join(BASE_DIR, "evals", "reviews", "lessons.jsonl")
+_lessons_cache = None  # (mtime, formatted_block)
+_lessons_lock = threading.Lock()
+
+
 def _load_lessons(limit=8):
-    """失败复盘教训（M4 写入 evals/reviews/lessons.jsonl），注入 prompt 避免重蹈覆辙。"""
-    path = os.path.join(BASE_DIR, "evals", "reviews", "lessons.jsonl")
+    """失败复盘教训（eval runner 失败时写入 lessons.jsonl），注入 prompt 避免重蹈覆辙。
+    mtime 缓存：文件没变就不重读。"""
+    global _lessons_cache
     try:
-        with open(path, encoding="utf-8") as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
+        mtime = os.path.getmtime(LESSONS_PATH)
+    except OSError:
+        return ""
+    with _lessons_lock:
+        if _lessons_cache is not None and _lessons_cache[0] == mtime:
+            return _lessons_cache[1]
+        try:
+            with open(LESSONS_PATH, encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+        except OSError:
+            return ""
         out = []
         for ln in lines[-limit:]:
             try:
@@ -630,24 +642,28 @@ def _load_lessons(limit=8):
                     out.append(f"- {text[:150]}")
             except ValueError:
                 continue
-        return "\n".join(out)
-    except OSError:
-        return ""
+        block = "\n".join(out)
+        _lessons_cache = (mtime, block)
+        return block
+
+
+# 错误哨兵：generate() 的所有错误 yield 都以这些前缀开头，
+# 记忆抽取据此跳过错误文本（防止单一前缀漂移导致错误内容污染长期记忆）
+ERROR_PREFIXES = ("[错误]", "[请求失败]")
+
+
+def _looks_like_error(text):
+    t = str(text or "").lstrip()
+    return any(t.startswith(p) for p in ERROR_PREFIXES)
 
 
 def _extraction_worker(space, user_text, assistant_text, history_tail):
     """后台记忆抽取：失败只记日志，绝不影响主对话。"""
     try:
-        store = agent_memory.MemoryStore(space)
-        existing = [m["content"] for m in store.items]
-        memories = agent_memory.extract_memories(
-            user_text, assistant_text, history_tail, existing=existing
-        )
-        if memories is None:
-            print("[memory] 抽取失败（见上一行日志）", flush=True)
-        elif memories:
-            ids = store.add_all(memories)
-            print(f"[memory] +{len(ids)} 条 ({space})", flush=True)
+        store = agent_memory.get_store(space)
+        ids = agent_memory.extract_and_store(store, user_text, assistant_text, history_tail)
+        if ids:
+            print(f"[memory] +{len(ids)} 条 ({store.space})", flush=True)
     except Exception as e:  # noqa: BLE001
         print(f"[memory] 抽取线程异常: {e}", flush=True)
 
@@ -690,10 +706,10 @@ def chat():
     space = card["key"]
     last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
 
-    mem_store = agent_memory.MemoryStore(space)
+    mem_store = agent_memory.get_store(space)
     memories_block = mem_store.to_prompt(mem_store.search(last_user or "打招呼 问候", k=6))
 
-    rag_store = agent_rag.RagStore(space)
+    rag_store = agent_rag.get_rag_store(space)
     rag_hits = rag_store.search(last_user, k=3) if last_user else []
     rag_block = rag_store.to_prompt(rag_hits)
 
@@ -739,13 +755,10 @@ def chat():
         finally:
             # 非开场白的完整一轮：后台抽取长期记忆（不阻塞响应）
             full_text = "".join(acc)
-            if not greeting and full_text and not full_text.lstrip().startswith("[错误]") \
-                    and not full_text.lstrip().startswith("[请求失败]"):
-                user_text = last_user
-                tail = messages[-6:]
+            if not greeting and full_text and not _looks_like_error(full_text):
                 threading.Thread(
                     target=_extraction_worker,
-                    args=(space, user_text, full_text, tail),
+                    args=(space, last_user, full_text, messages[-6:]),
                     daemon=True,
                 ).start()
 
@@ -786,10 +799,14 @@ def personas_delete(key):
     return (jsonify({"ok": True}) if ok else (jsonify({"error": "角色不存在"}), 404))
 
 
+def _resolve_space(space_param):
+    """面板/端点的 space 与聊天写入侧走同一套角色解析（未知 key 落到 gentle）。"""
+    return agent_persona.get_card(space_param or "default")["key"]
+
+
 @app.route("/api/memories")
 def memories_list():
-    space = request.args.get("space", "default")
-    store = agent_memory.MemoryStore(space)
+    store = agent_memory.get_store(_resolve_space(request.args.get("space", "default")))
     items = sorted(store.items, key=lambda m: -m["ts"])
     return jsonify([
         {"id": m["id"], "type": m["type"], "content": m["content"], "ts": m["ts"]}
@@ -799,15 +816,14 @@ def memories_list():
 
 @app.route("/api/memories/<mid>", methods=["DELETE"])
 def memories_delete(mid):
-    space = request.args.get("space", "default")
-    ok = agent_memory.MemoryStore(space).delete(mid)
+    store = agent_memory.get_store(_resolve_space(request.args.get("space", "default")))
+    ok = store.delete(mid)
     return (jsonify({"ok": True}) if ok else (jsonify({"error": "记忆不存在"}), 404))
 
 
 @app.route("/api/docs")
 def docs_list():
-    space = request.args.get("space", "default")
-    return jsonify(agent_rag.RagStore(space).list_docs())
+    return jsonify(agent_rag.get_rag_store(_resolve_space(request.args.get("space", "default"))).list_docs())
 
 
 @app.route("/api/docs", methods=["POST"])
@@ -820,9 +836,9 @@ def docs_upload():
         return jsonify({"error": "文档过长（上限 20 万字）"}), 400
     if not name:
         return jsonify({"error": "缺少 name"}), 400
-    space = request.args.get("space", "default")
+    store = agent_rag.get_rag_store(_resolve_space(request.args.get("space", "default")))
     try:
-        info = agent_rag.RagStore(space).add_doc(name, text)
+        info = store.add_doc(name, text)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"ok": True, **info})
@@ -830,8 +846,8 @@ def docs_upload():
 
 @app.route("/api/docs/<doc_id>", methods=["DELETE"])
 def docs_delete(doc_id):
-    space = request.args.get("space", "default")
-    ok = agent_rag.RagStore(space).delete_doc(doc_id)
+    store = agent_rag.get_rag_store(_resolve_space(request.args.get("space", "default")))
+    ok = store.delete_doc(doc_id)
     return (jsonify({"ok": True}) if ok else (jsonify({"error": "文档不存在"}), 404))
 
 

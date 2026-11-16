@@ -1,13 +1,14 @@
 """长期记忆：抽取（轻量模型）→ 存储 → 检索 → 注入 prompt。
 
 记忆类型与权重：
-- correction 用户纠正（「我不吃辣」推翻旧偏好）权重最高，入库时覆盖旧记忆
+- correction 用户纠正（「我不吃辣」推翻旧偏好）权重最高，入库时经 obsolete 机制删除被推翻的旧条
 - preference 用户偏好（喜欢/讨厌/习惯）
 - event 重要事件（生日、搬家、生病……）
 - emotion 情绪状态（近期低落/开心，供共情参考）
 
-存储：data/memories/<space>.json（space 按角色区分）。
-检索：字符 2-gram Jaccard 重合度 × 类型权重 + 时间新近度（无向量库的轻量方案）。
+存储：data/memories/<space>.json（space 按角色区分，经 normalize_space 清洗）。
+检索：字符 2-gram 重合度 × 类型权重 + 时间新近度（分词器在 agent/textproc.py，无向量库）。
+实例经 get_store() 按 space 缓存复用，避免每条消息重读磁盘。
 """
 import json
 import os
@@ -16,44 +17,33 @@ import threading
 import time
 import uuid
 
+from agent import textproc
+from agent.textproc import atomic_write_json, containment, jaccard, parse_llm_json, token_set
+
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 MEM_DIR = os.path.join(DATA_DIR, "memories")
 
 TYPE_WEIGHT = {"correction": 3.0, "preference": 2.2, "event": 1.6, "emotion": 1.2}
 VALID_TYPES = set(TYPE_WEIGHT)
 _MAX_ITEMS = 200          # 单个 space 的记忆条数上限
-_ngram_cache = {}         # 文本 → 2-gram 集合（进程内复用）
 _lock = threading.RLock()  # 可重入：add() 持锁期间调用 _save() 会再次申请同一把锁
 
-
-def _tokens(text):
-    """中文文本 → 字符 2-gram 集合（含 ASCII 词），用于相似度与重合度计算。"""
-    cached = _ngram_cache.get(text)
-    if cached is not None:
-        return cached
-    text = re.sub(r"\s+", "", str(text).lower())
-    words = re.findall(r"[a-z0-9]+", text)
-    grams = set(words)
-    for i in range(len(text) - 1):
-        grams.add(text[i:i + 2])
-    if len(grams) > 512:  # 超长文本截断，防缓存膨胀
-        grams = set(list(grams)[:512])
-    _ngram_cache[text] = grams
-    if len(_ngram_cache) > 2000:  # 简单防膨胀
-        _ngram_cache.clear()
-    return grams
+_store_cache = {}  # space -> MemoryStore（进程内复用，避免每条消息重读 JSON）
 
 
-def _jaccard(a, b):
-    if not a or not b:
-        return 0.0
-    inter = len(a & b)
-    return inter / (len(a) + len(b) - inter)
+def normalize_space(space):
+    """space 名统一清洗（memory 与 rag 共用同一规则，保证两边落到同一文件）。"""
+    return re.sub(r"[^\w\-]", "_", str(space))[:40] or "default"
+
+
+def _is_similar(g_old, g_new, jac_t=0.5, contain_t=0.65):
+    """两条记忆是否指同一事实：2-gram Jaccard 或包含度过阈值。"""
+    return jaccard(g_old, g_new) >= jac_t or containment(g_old, g_new) >= contain_t
 
 
 class MemoryStore:
     def __init__(self, space="default"):
-        self.space = re.sub(r"[^\w\-]", "_", space)[:40] or "default"
+        self.space = normalize_space(space)
         self.path = os.path.join(MEM_DIR, f"{self.space}.json")
         self.items = []
         self._load()
@@ -67,29 +57,28 @@ class MemoryStore:
             self.items = []
 
     def _save(self):
-        os.makedirs(MEM_DIR, exist_ok=True)
-        tmp = self.path + ".tmp"
-        with _lock:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.items, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self.path)
+        atomic_write_json(self.path, self.items)
 
-    def add(self, mtype, content, source="chat"):
-        """新增记忆；与旧记忆高度相似时视为同一条（触碰刷新），否则追加。"""
+    def clear(self):
+        with _lock:
+            self.items = []
+        self._save()
+
+    def add(self, mtype, content, source="chat", save=True):
+        """新增记忆；与旧记忆高度相似时视为同一条（触碰刷新）。
+        save=False 供批量入库（add_all）在循环外统一落盘。"""
         mtype = mtype if mtype in VALID_TYPES else "event"
         content = re.sub(r"\s+", " ", str(content)).strip()[:200]
         if not content:
             return None
-        grams = _tokens(content)
+        grams = token_set(content)
         now = time.time()
         with _lock:
             for m in self.items:
-                g_old = _tokens(m["content"])
-                inter = len(g_old & grams)
-                contain = inter / max(1, min(len(g_old), len(grams)))
-                if _jaccard(g_old, grams) >= 0.5 or contain >= 0.65:
+                if _is_similar(token_set(m["content"]), grams):
                     m["ts"] = now  # 触碰即视为仍然有效（同一条事实的不同说法）
-                    self._save()
+                    if save:
+                        self._save()
                     return m["id"]
             m = {"id": uuid.uuid4().hex[:10], "type": mtype, "content": content,
                  "ts": now, "source": source}
@@ -101,19 +90,17 @@ class MemoryStore:
                 )
                 for v in victims[: len(self.items) - _MAX_ITEMS]:
                     self.items.remove(v)
-            self._save()
+            if save:
+                self._save()
             return m["id"]
 
     def _drop_similar_locked(self, text, threshold=0.5):
-        """删除与 text 相似的旧记忆（调用方须已持锁）。"""
-        grams = _tokens(text)
+        """删除与 text 相似的旧记忆（调用方须已持锁）。返回删除条数。"""
+        grams = token_set(text)
         kept = []
         removed = 0
         for m in self.items:
-            g_old = _tokens(m["content"])
-            inter = len(g_old & grams)
-            contain = inter / max(1, min(len(g_old), len(grams)))
-            if _jaccard(g_old, grams) >= threshold or contain >= threshold:
+            if _is_similar(token_set(m["content"]), grams, jac_t=threshold, contain_t=threshold):
                 removed += 1
                 continue
             kept.append(m)
@@ -121,28 +108,28 @@ class MemoryStore:
         return removed
 
     def add_all(self, memories, source="chat"):
-        """批量入库。条目可带 obsolete（被本轮推翻的旧记忆原文），
-        入库前先按原文删除旧条，保证纠正真正生效。"""
+        """批量入库：整批只落盘一次。
+        条目可带 obsolete（被本轮推翻的旧记忆原文），入库前先按原文删除旧条，
+        保证纠正真正生效；带 obsolete 的条目一律记为 correction。"""
         ids = []
-        changed = False
-        for m in memories or []:
-            if not isinstance(m, dict):
-                continue
-            try:
-                with _lock:
+        with _lock:
+            mutated = False
+            for m in memories or []:
+                if not isinstance(m, dict):
+                    continue
+                try:
                     obsolete = re.sub(r"\s+", " ", str(m.get("obsolete") or "")).strip()
-                    if obsolete:
-                        if self._drop_similar_locked(obsolete):
-                            changed = True
-                mid = self.add(m.get("type", "correction") if obsolete else m.get("type", "event"),
-                               m.get("content", ""), source)
-                if mid:
-                    ids.append(mid)
-                    changed = True
-            except Exception:  # noqa: BLE001
-                pass
-        if changed:
-            self._save()
+                    if obsolete and self._drop_similar_locked(obsolete):
+                        mutated = True
+                    mtype = "correction" if obsolete else str(m.get("type", "event"))
+                    mid = self.add(mtype, m.get("content", ""), source, save=False)
+                    if mid:
+                        ids.append(mid)
+                        mutated = True
+                except Exception:  # noqa: BLE001
+                    pass
+            if mutated:
+                self._save()
         return ids
 
     def delete(self, mid):
@@ -156,11 +143,11 @@ class MemoryStore:
 
     def search(self, query, k=6):
         """按「重合度×类型权重 + 新近度」取 top-k。"""
-        q = _tokens(query)
+        q = token_set(query)
         now = time.time()
         scored = []
         for m in self.items:
-            overlap = _jaccard(q, _tokens(m["content"]))
+            overlap = jaccard(q, token_set(m["content"]))
             recency = max(0.0, 1.0 - (now - m["ts"]) / (30 * 86400)) * 0.6
             score = overlap * TYPE_WEIGHT.get(m["type"], 1.0) + recency
             if score <= 0.05:
@@ -175,6 +162,17 @@ class MemoryStore:
         labels = {"correction": "纠正", "preference": "偏好", "event": "事件", "emotion": "情绪"}
         lines = [f"- [{labels.get(m['type'], '备注')}] {m['content']}" for m in memories]
         return "\n".join(lines)
+
+
+def get_store(space):
+    """按 space 取共享 MemoryStore 实例（同 space 在请求间复用，不重复读盘）。"""
+    key = normalize_space(space)
+    with _lock:
+        store = _store_cache.get(key)
+        if store is None:
+            store = MemoryStore(key)
+            _store_cache[key] = store
+        return store
 
 
 # ============ 记忆抽取（轻量模型，路由 light） ============
@@ -208,18 +206,33 @@ def extract_memories(user_text, assistant_text, history_tail=None, existing=None
         known = "已知记忆清单：\n" + "\n".join(f"- {t}" for t in items) + "\n\n"
     prompt = f"{known}{history}用户: {user_text}\n角色: {assistant_text}\n\n提取记忆 JSON："
     try:
-        raw = _router.chat(
-            [{"role": "user", "content": prompt}],
-            EXTRACT_SYSTEM,
-            route="light",
-            max_tokens=800,  # GLM 默认开 thinking，思考也占 token 预算
-        )
-        raw = re.sub(r"^```(json)?|```$", "", raw.strip(), flags=re.M).strip()
-        start, end = raw.find("["), raw.rfind("]")
-        if start < 0 or end <= start:
-            return []
-        data = json.loads(raw[start:end + 1])
+        # GLM 始终思考，思考占 token 预算：预算不足时输出为空，加倍重试一次
+        data = None
+        for budget in (800, 1600):
+            raw = _router.chat(
+                [{"role": "user", "content": prompt}],
+                EXTRACT_SYSTEM,
+                route="light",
+                max_tokens=budget,
+            ) or ""
+            try:
+                data = parse_llm_json(raw, "[", "]")
+                break
+            except ValueError:
+                continue
+        if data is None:
+            print("[memory] 抽取输出无法解析（含空输出）", flush=True)
+            return None
         return data if isinstance(data, list) else []
     except Exception as e:  # noqa: BLE001
         print(f"[memory] 抽取调用失败: {type(e).__name__}: {str(e)[:120]}", flush=True)
         return None
+
+
+def extract_and_store(store, user_text, assistant_text, history_tail):
+    """抽取并入库（生产 _extraction_worker 与评估 runner 共用的同一步骤）。"""
+    existing = [m["content"] for m in store.items]
+    memories = extract_memories(user_text, assistant_text, history_tail, existing=existing)
+    if memories is None:
+        return None
+    return store.add_all(memories)
