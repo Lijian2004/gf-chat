@@ -67,6 +67,8 @@ Page({
     }
     this.history = st.history;
     this.greetingText = st.greeting;
+    // 自愈：上次登录前失败留下的错误文案不作为开场白残留
+    if (this.greetingText.indexOf("[请求失败]") === 0) this.greetingText = "";
     this.locationInfo = st.location;
     this.weatherText = "";
     this.weatherRefreshTimer = null;

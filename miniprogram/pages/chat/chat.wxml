@@ -88,8 +88,14 @@
       </scroll-view>
 
       <view class="call-actions">
-        <view class="call-btn {{muted ? 'is-muted' : ''}}" bindtap="toggleMute">{{muted ? '🔇\n已静音' : '🎙\n静音'}}</view>
-        <view class="call-btn hangup" bindtap="endCall">📵\n挂断</view>
+        <view class="call-btn {{muted ? 'is-muted' : ''}}" bindtap="toggleMute">
+          <view class="call-btn-icon">{{muted ? '🔇' : '🎙'}}</view>
+          <view>{{muted ? '已静音' : '静音'}}</view>
+        </view>
+        <view class="call-btn hangup" bindtap="endCall">
+          <view class="call-btn-icon">📵</view>
+          <view>挂断</view>
+        </view>
       </view>
     </view>
   </view>

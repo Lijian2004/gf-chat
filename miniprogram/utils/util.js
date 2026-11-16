@@ -121,28 +121,30 @@ function parseInline(text) {
 }
 
 function markdownToNodes(md) {
+  /* 注意：rich-text 只支持白名单内的 HTML 标签（div/p/span/code…），
+     不能用 view/text 这类小程序组件名，否则整个节点被忽略、渲染成空 */
   const nodes = [];
   for (const seg of splitCodeBlocks(md || "")) {
     if (seg.type === "code") {
       const children = [];
       if (seg.lang) {
         children.push({
-          name: "view",
+          name: "div",
           attrs: { class: "md-code-lang" },
           children: [{ type: "text", text: seg.lang }],
         });
       }
       children.push({
-        name: "view",
+        name: "pre",
         attrs: { class: "md-code-body" },
         children: [{ type: "text", text: seg.code }],
       });
-      nodes.push({ name: "view", attrs: { class: "md-code" }, children });
+      nodes.push({ name: "div", attrs: { class: "md-code" }, children });
     } else {
       for (const line of seg.text.split("\n")) {
         const inline = parseInline(line);
         nodes.push({
-          name: "view",
+          name: "p",
           attrs: { class: "md-p" },
           children: inline.length ? inline : [{ type: "text", text: "" }],
         });
