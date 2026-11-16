@@ -696,7 +696,7 @@ async function fetchWeather() {
     return false;
   }
   try {
-    const res = await axios.get("/api/weather", { params, timeout: 9000 });
+    const res = await axios.get("/api/weather", { params, timeout: 20000 });
     const d = res.data || {};
     if (!d.weather_text) return false;
     locationInfo = {
@@ -730,7 +730,7 @@ function getBrowserCoords(timeoutMs = 10000) {
 }
 
 async function locateByIP() {
-  const res = await axios.get("/api/location/ip", { timeout: 7000 });
+  const res = await axios.get("/api/location/ip", { timeout: 12000 });
   const d = res.data || {};
   if (!d.city || d.lat == null) return false;
   locationInfo = { city: d.city, lat: d.lat, lon: d.lon };
@@ -779,7 +779,7 @@ async function saveManualCity() {
   locationStatusEl.classList.remove("error");
   locationStatusEl.textContent = "查询中…";
   try {
-    const res = await axios.get("/api/weather", { params: { city: name }, timeout: 9000 });
+    const res = await axios.get("/api/weather", { params: { city: name }, timeout: 20000 });
     const d = res.data || {};
     locationInfo = { city: d.city || name, lat: d.lat, lon: d.lon };
     weatherText = d.weather_text || "";

@@ -247,10 +247,22 @@ def _cache_put(key, value, ttl):
                 _geo_cache.pop(next(iter(_geo_cache)))
 
 
-def _http_get_json(url, timeout=GEO_TIMEOUT):
-    req = urllib.request.Request(url, headers={"User-Agent": "gf-chat/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def _http_get_json(url, timeout=GEO_TIMEOUT, retries=3):
+    """GET JSON，带瞬时错误重试（境外 API 网络抖动时 SSL 握手可能超时）。"""
+    delays = (0.0, 0.4, 1.0)  # 各次尝试前的等待
+    last_exc = None
+    for i in range(retries):
+        if delays[i]:
+            time.sleep(delays[i])
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "gf-chat/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.HTTPError, LookupError, ValueError):
+            raise  # 业务错误（4xx/5xx）或 JSON 解析失败，重试无意义
+        except Exception as e:  # noqa: BLE001 - URLError/SSL/超时等瞬时网络错误
+            last_exc = e
+    raise last_exc
 
 
 # WMO 天气现象代码 →（中文描述, emoji）
