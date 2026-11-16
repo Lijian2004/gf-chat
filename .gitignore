@@ -15,3 +15,7 @@ tts_*.mp3
 
 # 根目录原始头像（实际用的是 static/avatar.png）
 /avatar.png
+data/
+evals/reports/
+evals/reviews/
+__pycache__/
