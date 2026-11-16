@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AI 女友 · 你的专属陪伴</title>
+  <title>角色扮演 Agent · 你的专属陪伴</title>
   <link rel="icon" href="data:," />
 
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -19,49 +19,31 @@
   <div class="setup-screen" id="setup-screen">
     <div class="setup-card">
       <div class="setup-head">
-        <div class="setup-logo" id="setup-logo">💞</div>
-        <h1>打造你的专属 AI 女友</h1>
-        <p>先选性格，再给她起个名字</p>
+        <div class="setup-logo" id="setup-logo">🎭</div>
+        <h1>打造你的专属角色</h1>
+        <p>先选角色人设，再起个名字</p>
       </div>
 
       <div class="setup-section">
-        <p class="setup-label">选择她的性格</p>
-        <div class="personality-grid">
-          <button class="personality-card selected" data-personality="gentle" type="button">
-            <span class="personality-card__emoji">🌷</span>
-            <span class="personality-card__name">温柔</span>
-            <span class="personality-card__desc">轻声细语，治愈你的每一天</span>
-          </button>
-          <button class="personality-card" data-personality="tsundere" type="button">
-            <span class="personality-card__emoji">😤</span>
-            <span class="personality-card__name">傲娇</span>
-            <span class="personality-card__desc">口是心非，藏不住对你的喜欢</span>
-          </button>
-          <button class="personality-card" data-personality="aloof" type="button">
-            <span class="personality-card__emoji">❄️</span>
-            <span class="personality-card__name">高冷</span>
-            <span class="personality-card__desc">话少可靠，偶尔流露温柔</span>
-          </button>
-          <button class="personality-card" data-personality="sharp" type="button">
-            <span class="personality-card__emoji">⚡</span>
-            <span class="personality-card__name">犀利</span>
-            <span class="personality-card__desc">一针见血，聪明爱吐槽</span>
-          </button>
-          <button class="personality-card" data-personality="grumpy" type="button">
-            <span class="personality-card__emoji">🔥</span>
-            <span class="personality-card__name">暴躁</span>
-            <span class="personality-card__desc">脾气来得快去得快，其实很在意你</span>
-          </button>
-          <button class="personality-card" data-personality="shy" type="button">
-            <span class="personality-card__emoji">🌸</span>
-            <span class="personality-card__name">害羞</span>
-            <span class="personality-card__desc">容易脸红，需要你主动一点</span>
-          </button>
+        <p class="setup-label">选择角色</p>
+        <div class="personality-grid" id="personality-grid">
+          <!-- 由 script.js 动态渲染（预设 + 自定义角色卡） -->
+        </div>
+        <button class="persona-add-btn" id="persona-add-btn" type="button">＋ 自定义角色</button>
+        <div class="persona-form hidden" id="persona-form">
+          <input class="persona-input" id="persona-name-input" type="text" maxlength="12" placeholder="角色名（如：剑客、学姐…）" autocomplete="off" />
+          <textarea class="persona-textarea" id="persona-text" rows="4" maxlength="800" placeholder="角色设定：性格、说话方式、与用户的关系……"></textarea>
+          <textarea class="persona-textarea" id="persona-bounds" rows="2" maxlength="400" placeholder="角色特有边界（每行一条，可留空），如：绝不谈论前任"></textarea>
+          <div class="persona-form__actions">
+            <button class="location-action primary" id="persona-save-btn" type="button">创建角色</button>
+            <button class="location-action" id="persona-cancel-btn" type="button">取消</button>
+          </div>
+          <p class="location-status" id="persona-form-status"></p>
         </div>
       </div>
 
       <div class="setup-section">
-        <p class="setup-label">给她起个名字</p>
+        <p class="setup-label">给角色起个名字（称呼）</p>
         <input
           class="name-input"
           id="name-input"
@@ -119,6 +101,32 @@
         <div class="voice-picker__chips" id="voice-picker">
           <!-- 由 script.js 动态渲染 -->
         </div>
+      </div>
+
+      <div class="sidebar__divider"></div>
+
+      <div class="memory-panel">
+        <p class="tips__title">
+          长期记忆
+          <button class="memory-refresh" id="memory-refresh-btn" type="button" title="刷新">⟳</button>
+        </p>
+        <div class="memory-list" id="memory-list">
+          <p class="memory-empty">聊得越多，她记得越多</p>
+        </div>
+
+        <div class="sidebar__divider"></div>
+
+        <p class="tips__title">记忆库 · 上传日记/聊天记录</p>
+        <div class="doc-list" id="doc-list"></div>
+        <div class="doc-upload hidden" id="doc-upload">
+          <input class="doc-input" id="doc-name-input" type="text" maxlength="50" placeholder="资料名，如：2026年日记" autocomplete="off" />
+          <textarea class="doc-textarea" id="doc-text-input" rows="4" maxlength="200000" placeholder="粘贴日记或聊天记录全文…"></textarea>
+          <div class="location-editor__actions">
+            <button class="location-action primary" id="doc-save-btn" type="button">保存</button>
+            <button class="location-action" id="doc-cancel-btn" type="button">取消</button>
+          </div>
+        </div>
+        <button class="doc-add-btn" id="doc-add-btn" type="button">＋ 上传资料</button>
       </div>
 
       <div class="sidebar__divider"></div>
@@ -187,7 +195,7 @@
         <div class="empty-state" id="empty-state">
           <div class="empty-state__icon">💞</div>
           <h2>和她开始聊天吧</h2>
-          <p>输入消息，你的 AI 女友会马上回复你。</p>
+          <p>输入消息，你的角色会马上回复你。</p>
         </div>
       </div>
 

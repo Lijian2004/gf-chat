@@ -9,7 +9,8 @@ const resetBtn = document.getElementById("reset-btn");
 const setupScreen = document.getElementById("setup-screen");
 const nameInput = document.getElementById("name-input");
 const startBtn = document.getElementById("start-btn");
-const personalityCards = document.querySelectorAll(".personality-card");
+
+/* 角色卡网格已改为动态渲染（见 renderPersonas / loadPersonas） */
 
 const brandNameEl = document.getElementById("brand-name");
 const brandSubEl = document.getElementById("brand-sub");
@@ -41,6 +42,24 @@ const callTranscriptEl = document.getElementById("call-transcript");
 const callMuteBtn = document.getElementById("call-mute-btn");
 const callHangupBtn = document.getElementById("call-hangup-btn");
 const callBtnHeader = document.getElementById("call-btn");
+const personaGridEl = document.getElementById("personality-grid");
+const personaAddBtn = document.getElementById("persona-add-btn");
+const personaFormEl = document.getElementById("persona-form");
+const personaNameInput = document.getElementById("persona-name-input");
+const personaTextEl = document.getElementById("persona-text");
+const personaBoundsEl = document.getElementById("persona-bounds");
+const personaSaveBtn = document.getElementById("persona-save-btn");
+const personaCancelBtn = document.getElementById("persona-cancel-btn");
+const personaFormStatus = document.getElementById("persona-form-status");
+const memoryListEl = document.getElementById("memory-list");
+const memoryRefreshBtn = document.getElementById("memory-refresh-btn");
+const docListEl = document.getElementById("doc-list");
+const docUploadEl = document.getElementById("doc-upload");
+const docNameInput = document.getElementById("doc-name-input");
+const docTextInput = document.getElementById("doc-text-input");
+const docSaveBtn = document.getElementById("doc-save-btn");
+const docCancelBtn = document.getElementById("doc-cancel-btn");
+const docAddBtn = document.getElementById("doc-add-btn");
 
 /* 性格元数据（与后端 PERSONALITIES 保持一致，用于前端展示） */
 const PERSONALITY_META = {
@@ -1441,6 +1460,7 @@ async function sendMessage(userText) {
     history.push({ role: "assistant", content: reply });
     saveState();
   }
+  setTimeout(refreshMemoryPanel, 8000); // 后台记忆抽取完成后刷新面板
   inputEl.focus();
 }
 
@@ -1462,8 +1482,8 @@ function stopGeneration() {
 /* ============ 设定流程 ============ */
 function updateIdentity() {
   const meta = PERSONALITY_META[gfPersonality] || PERSONALITY_META.gentle;
-  brandNameEl.textContent = gfName || "AI 女友";
-  brandSubEl.textContent = "你的 AI 女友";
+  brandNameEl.textContent = gfName || "角色扮演";
+  brandSubEl.textContent = "你的专属角色";
   injectAvatar(gfEmojiEl, meta.emoji, meta.label);
   injectAvatar(setupLogoEl, "💞", "头像");
   gfLabelEl.textContent = meta.label;
@@ -1471,7 +1491,7 @@ function updateIdentity() {
   chatStatusEl.innerHTML = gfName
     ? `💞 与 ${escapeHtml(gfName)} 恋爱中`
     : "💞 恋爱中";
-  document.title = gfName ? `${gfName} · 你的 AI 女友` : "AI 女友 · 你的专属陪伴";
+  document.title = gfName ? `${gfName} · 你的专属角色` : "角色扮演 Agent · 你的专属陪伴";
 }
 
 function checkStartEnabled() {
@@ -1502,14 +1522,117 @@ async function startSetup() {
   await startGreeting();
 }
 
-/* ============ 事件绑定 ============ */
-personalityCards.forEach((card) => {
-  card.addEventListener("click", () => {
-    gfPersonality = card.dataset.personality;
-    personalityCards.forEach((c) => c.classList.toggle("selected", c === card));
-    checkStartEnabled();
+/* ============ 角色卡：动态渲染 + 自定义角色 ============ */
+let personaList = []; // /api/personas 返回的角色卡
+
+function renderPersonas(cards) {
+  personaGridEl.innerHTML = cards
+    .map(
+      (c) => `
+    <button class="personality-card${c.key === gfPersonality ? " selected" : ""}" data-personality="${escapeHtml(c.key)}" type="button">
+      <span class="personality-card__emoji">${escapeHtml(c.emoji || "🎭")}</span>
+      <span class="personality-card__name">${escapeHtml(c.name)}${c.custom ? " ·自建" : ""}</span>
+      <span class="personality-card__desc">${escapeHtml((c.persona || "").slice(0, 26) || c.desc || "")}</span>
+    </button>`
+    )
+    .join("");
+}
+
+function syncPersonaSelection() {
+  personaGridEl.querySelectorAll(".personality-card").forEach((c) => {
+    c.classList.toggle("selected", c.dataset.personality === gfPersonality);
   });
+}
+
+/* 预设卡先渲染（登录前可见），登录后再合并服务端（含自定义） */
+function initialPersonas() {
+  return Object.entries(PERSONALITY_META).map(([key, m]) => ({
+    key,
+    name: m.label,
+    emoji: m.emoji,
+    persona: m.desc,
+    custom: false,
+  }));
+}
+
+async function loadPersonas() {
+  try {
+    const res = await axios.get("/api/personas");
+    personaList = Array.isArray(res.data) ? res.data : [];
+  } catch (e) {
+    personaList = initialPersonas();
+  }
+  // 把自定义角色并进 PERSONALITY_META，让头像/标签等旧逻辑直接生效
+  personaList.forEach((c) => {
+    if (c.custom) {
+      PERSONALITY_META[c.key] = {
+        label: c.name,
+        emoji: c.emoji || "🎭",
+        desc: (c.persona || "").slice(0, 24),
+      };
+    }
+  });
+  renderPersonas(personaList);
+  syncPersonaSelection();
+}
+
+personaGridEl.addEventListener("click", (e) => {
+  const card = e.target.closest(".personality-card");
+  if (!card) return;
+  gfPersonality = card.dataset.personality;
+  syncPersonaSelection();
+  checkStartEnabled();
 });
+
+personaAddBtn.addEventListener("click", () => {
+  personaFormEl.classList.toggle("hidden");
+  personaFormStatus.textContent = "";
+  if (!personaFormEl.classList.contains("hidden")) personaNameInput.focus();
+});
+
+personaCancelBtn.addEventListener("click", () => {
+  personaFormEl.classList.add("hidden");
+  personaNameInput.value = "";
+  personaTextEl.value = "";
+  personaBoundsEl.value = "";
+});
+
+personaSaveBtn.addEventListener("click", async () => {
+  const name = personaNameInput.value.trim();
+  const persona = personaTextEl.value.trim();
+  if (!name || !persona) {
+    personaFormStatus.textContent = "角色名和设定都要填";
+    personaFormStatus.classList.add("error");
+    return;
+  }
+  personaSaveBtn.disabled = true;
+  try {
+    const boundaries = personaBoundsEl.value
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    await axios.post("/api/personas", { key: name, name, persona, boundaries });
+    personaFormEl.classList.add("hidden");
+    personaNameInput.value = "";
+    personaTextEl.value = "";
+    personaBoundsEl.value = "";
+    await loadPersonas();
+    gfPersonality = [...name]
+      .filter((ch) => /[a-zA-Z0-9一-鿿_-]/.test(ch))
+      .join("")
+      .slice(0, 30);
+    syncPersonaSelection();
+    checkStartEnabled();
+    personaFormStatus.textContent = "";
+  } catch (e) {
+    personaFormStatus.textContent = apiErrorText(e, "创建失败，请稍后再试");
+    personaFormStatus.classList.add("error");
+  } finally {
+    personaSaveBtn.disabled = false;
+  }
+});
+
+/* ============ 事件绑定 ============ */
 
 nameInput.addEventListener("input", checkStartEnabled);
 nameInput.addEventListener("keydown", (e) => {
@@ -1523,9 +1646,7 @@ startBtn.addEventListener("click", startSetup);
 function openSetup() {
   if (isStreaming) return;
   nameInput.value = gfName || "";
-  personalityCards.forEach((c) =>
-    c.classList.toggle("selected", c.dataset.personality === gfPersonality)
-  );
+  syncPersonaSelection();
   checkStartEnabled();
   setupScreen.classList.remove("hidden");
   nameInput.focus();
@@ -1561,6 +1682,107 @@ inputEl.addEventListener("keydown", (e) => {
 });
 
 inputEl.addEventListener("input", autoResize);
+
+/* ============ 记忆面板：长期记忆 + RAG 文档管理 ============ */
+const MEM_TYPE_LABEL = { correction: "纠正", preference: "偏好", event: "事件", emotion: "情绪" };
+
+function memSpace() {
+  return gfPersonality || "default";
+}
+
+async function refreshMemoryPanel() {
+  const space = memSpace();
+  try {
+    const [memRes, docRes] = await Promise.all([
+      axios.get("/api/memories", { params: { space }, timeout: 10000 }),
+      axios.get("/api/docs", { params: { space }, timeout: 10000 }),
+    ]);
+    renderMemoryList(memRes.data || []);
+    renderDocList(docRes.data || []);
+  } catch (e) { /* 未登录等场景静默 */ }
+}
+
+function renderMemoryList(items) {
+  if (!items.length) {
+    memoryListEl.innerHTML = '<p class="memory-empty">聊得越多，她记得越多</p>';
+    return;
+  }
+  memoryListEl.innerHTML = items
+    .map(
+      (m) => `
+    <div class="memory-item">
+      <span class="memory-type memory-type--${escapeHtml(m.type)}">${MEM_TYPE_LABEL[m.type] || "备注"}</span>
+      <span class="memory-content" title="${escapeHtml(m.content)}">${escapeHtml(m.content)}</span>
+      <button class="memory-del" data-mid="${escapeHtml(m.id)}" type="button" title="忘掉这条">×</button>
+    </div>`
+    )
+    .join("");
+}
+
+function renderDocList(items) {
+  if (!items.length) {
+    docListEl.innerHTML = '<p class="memory-empty">还没有上传资料</p>';
+    return;
+  }
+  docListEl.innerHTML = items
+    .map(
+      (d) => `
+    <div class="doc-item">
+      <span class="doc-name" title="${escapeHtml(d.name)}">📄 ${escapeHtml(d.name)} · ${d.chunks}块</span>
+      <button class="memory-del" data-doc-id="${escapeHtml(d.id)}" type="button" title="删除">×</button>
+    </div>`
+    )
+    .join("");
+}
+
+memoryListEl.addEventListener("click", async (e) => {
+  const btn = e.target.closest(".memory-del");
+  if (!btn) return;
+  try {
+    await axios.delete(`/api/memories/${btn.dataset.mid}`, { params: { space: memSpace() } });
+    refreshMemoryPanel();
+  } catch (err) { /* 静默 */ }
+});
+
+docListEl.addEventListener("click", async (e) => {
+  const btn = e.target.closest(".memory-del");
+  if (!btn) return;
+  try {
+    await axios.delete(`/api/docs/${btn.dataset.docId}`, { params: { space: memSpace() } });
+    refreshMemoryPanel();
+  } catch (err) { /* 静默 */ }
+});
+
+memoryRefreshBtn.addEventListener("click", refreshMemoryPanel);
+
+docAddBtn.addEventListener("click", () => {
+  docUploadEl.classList.toggle("hidden");
+  if (!docUploadEl.classList.contains("hidden")) docNameInput.focus();
+});
+
+docCancelBtn.addEventListener("click", () => {
+  docUploadEl.classList.add("hidden");
+  docNameInput.value = "";
+  docTextInput.value = "";
+});
+
+docSaveBtn.addEventListener("click", async () => {
+  const name = docNameInput.value.trim();
+  const text = docTextInput.value.trim();
+  if (!name || !text) return;
+  docSaveBtn.disabled = true;
+  try {
+    await axios.post(`/api/docs?space=${encodeURIComponent(memSpace())}`, { name, text }, { timeout: 30000 });
+    docUploadEl.classList.add("hidden");
+    docNameInput.value = "";
+    docTextInput.value = "";
+    refreshMemoryPanel();
+  } catch (e) {
+    alert(apiErrorText(e, "保存失败"));
+  } finally {
+    docSaveBtn.disabled = false;
+  }
+});
 
 /* 动态获取后端模型名，展示在侧边栏徽章 */
 async function fetchModelBadge() {
@@ -1614,7 +1836,9 @@ loginPasswordEl.addEventListener("keydown", (e) => {
    已登录时由 init 直接调用，未登录时由 doLogin 成功后调用，避免发出注定 401 的请求 */
 function bootstrapAfterAuth() {
   if (!voicePersonas.length) loadVoicePersonas();
+  loadPersonas();
   initLocation();
+  refreshMemoryPanel();
 }
 
 (async function init() {
@@ -1652,9 +1876,8 @@ function bootstrapAfterAuth() {
   }
 
   nameInput.value = savedName;
-  personalityCards.forEach((c) =>
-    c.classList.toggle("selected", c.dataset.personality === gfPersonality)
-  );
+  renderPersonas(initialPersonas());
+  syncPersonaSelection();
 
   updateIdentity();
   checkStartEnabled();
