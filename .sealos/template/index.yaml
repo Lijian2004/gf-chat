@@ -3,16 +3,53 @@ kind: Template
 metadata:
   name: gf-chat-v2
 spec:
-  title: GF Chat（持久化版）
+  title: 'AI 女友聊天（GF Chat）'
   url: ''
-  gitRepo: ''
-  author: ''
-  description: 带 /app/data 持久卷的版本，记忆、日记、亲密度等数据跨重启保留
-  readme: ''
-  icon: ''
+  gitRepo: 'https://github.com/Lijian2004/gf-chat'
+  author: 'Lijian2004'
+  description: >-
+    AI girlfriend chat app with long-term memory, intimacy levels, diary,
+    proactive messages and voice calls. Powered by DeepSeek and GLM, with
+    Doubao TTS/ASR.
+  readme: |
+    ## 这是什么
+
+    一个带长期记忆的 AI 女友聊天应用：可自定义人格与昵称，聊天内容会沉淀为长期记忆，
+    并随互动累积亲密度。
+
+    ## 部署前准备
+
+    - **DeepSeek API Key（必填）**：主对话模型，填写 `deepseek_api_key`
+    - 智谱 API Key（可选）：长期记忆抽取与备用模型，填写 `bigmodel_api_key_1` / `bigmodel_api_key_2`
+    - 火山引擎语音 Key（可选）：语音播报与语音通话，填写 `volc_api_key`；不填则回退浏览器语音
+    - 访问密码（可选）：填写后进入页面需输入密码，留空则不开启登录验证
+
+    ## 功能
+
+    - 多模型路由：DeepSeek 主链路 + GLM 备用链路
+    - 长期记忆与轻量 RAG：自动抽取偏好、纠正、事件，旧记忆会被新事实推翻
+    - 亲密度系统：6 个等级，影响称呼与语气，每日对话加分有上限
+    - 她会主动找你：长时间未互动时主动发消息
+    - 日记与时间线：每日一篇日记 + 「她眼中的你」画像
+    - 语音：豆包 TTS 播报、语音通话（VAD 自动断句）
+    - 数据持久化：`/app/data` 1Gi 卷，重启不丢记忆、日记与亲密度
+
+    ## 说明
+
+    - 容器端口 8000，对外域名由 Ingress 自动分配
+    - 照片功能依赖 `dreamina-canvas` CLI，镜像未内置，会自动降级（隐藏相机按钮）
+    - 源码：https://github.com/Lijian2004/gf-chat
+  icon: 'https://gf-chat-v2-zuhynnlb.sealosbja.site/static/avatar.png'
   templateType: inline
   locale: en
-  categories: []
+  i18n:
+    zh:
+      description: >-
+        带长期记忆的 AI 女友聊天应用：亲密度成长、日记与时间线、主动关心、
+        语音通话，数据持久化保存。
+  categories:
+    - ai
+    - frontend
   defaults:
     app_name:
       type: string
@@ -194,6 +231,6 @@ spec:
   data:
     url: https://${{ defaults.app_host }}.${{ SEALOS_CLOUD_DOMAIN }}
   displayType: normal
-  icon: ''
-  name: GF Chat（持久化版）
+  icon: 'https://gf-chat-v2-zuhynnlb.sealosbja.site/static/avatar.png'
+  name: 'AI 女友聊天（GF Chat）'
   type: link
