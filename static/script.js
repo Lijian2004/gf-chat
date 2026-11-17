@@ -360,7 +360,7 @@ function updateBubble(bubble, text) {
 
 /* ============ 语音播报（edge-tts 神经网络语音 + 浏览器兜底） ============ */
 let voiceEnabled = true;
-let voicePersona = "gentle";
+let voicePersona = "sweet";
 let selectedVoice = null; // 浏览器语音（仅兜底用）
 let currentAudio = null;  // { audio, url }
 let voicePersonas = [];
@@ -2337,7 +2337,7 @@ function bootstrapAfterAuth() {
 
   // 语音播报设置（默认开启）
   if (localStorage.getItem(STORAGE_KEYS.voice) === "0") voiceEnabled = false;
-  voicePersona = localStorage.getItem(STORAGE_KEYS.voicePersona) || "gentle";
+  voicePersona = localStorage.getItem(STORAGE_KEYS.voicePersona) || "sweet";
   initVoices();
   updateVoiceUI();
 

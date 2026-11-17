@@ -58,7 +58,7 @@ TTS_VOICES = {
     "loli":      {"label": "萝莉", "emoji": "🍭", "speaker": "zh_female_sajiaoxuemei_uranus_bigtts"},
     "energetic": {"label": "元气", "emoji": "⚡", "speaker": "zh_female_vv_uranus_bigtts"},
 }
-DEFAULT_TTS_VOICE = "gentle"
+DEFAULT_TTS_VOICE = "sweet"
 TTS_MAX_LEN = 500            # 单次朗读最大字符数
 ASR_MAX_BYTES = 10 * 1024 * 1024  # ASR 单次音频上限 10MB
 TTS_RETRIES = 2              # 豆包端点偶发失败时的重试次数
