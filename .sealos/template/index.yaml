@@ -1,7 +1,7 @@
 apiVersion: app.sealos.io/v1
 kind: Template
 metadata:
-  name: gf-chat-v2
+  name: gf-chat
 spec:
   title: 'AI 女友聊天（GF Chat）'
   url: ''
@@ -39,7 +39,7 @@ spec:
     - 容器端口 8000，对外域名由 Ingress 自动分配
     - 照片功能依赖 `dreamina-canvas` CLI，镜像未内置，会自动降级（隐藏相机按钮）
     - 源码：https://github.com/Lijian2004/gf-chat
-  icon: 'https://gf-chat-v2-zuhynnlb.sealosbja.site/static/avatar.png'
+  icon: 'https://gf-chat-zuhynnlb.sealosbja.site/static/avatar.png'
   templateType: inline
   locale: en
   i18n:
@@ -53,10 +53,10 @@ spec:
   defaults:
     app_name:
       type: string
-      value: gf-chat-v2-${{ random(8) }}
+      value: gf-chat-${{ random(8) }}
     app_host:
       type: string
-      value: gf-chat-v2-${{ random(8) }}
+      value: gf-chat-${{ random(8) }}
   inputs:
     access_password:
       description: 访问密码（部署后进入页面需输入）；留空则不开启登录验证
@@ -87,30 +87,30 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: ${{ defaults.app_name }}-gf-chat-v2
+  name: ${{ defaults.app_name }}-gf-chat
   annotations:
     originImageName: ghcr.io/lijian2004/gf-chat:latest
     deploy.cloud.sealos.io/minReplicas: '1'
     deploy.cloud.sealos.io/maxReplicas: '1'
   labels:
-    app: ${{ defaults.app_name }}-gf-chat-v2
-    cloud.sealos.io/app-deploy-manager: ${{ defaults.app_name }}-gf-chat-v2
+    app: ${{ defaults.app_name }}-gf-chat
+    cloud.sealos.io/app-deploy-manager: ${{ defaults.app_name }}-gf-chat
 spec:
   replicas: 1
   revisionHistoryLimit: 1
-  serviceName: ${{ defaults.app_name }}-gf-chat-v2
+  serviceName: ${{ defaults.app_name }}-gf-chat
   selector:
     matchLabels:
-      app: ${{ defaults.app_name }}-gf-chat-v2
+      app: ${{ defaults.app_name }}-gf-chat
   template:
     metadata:
       labels:
-        app: ${{ defaults.app_name }}-gf-chat-v2
+        app: ${{ defaults.app_name }}-gf-chat
     spec:
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: 10
       containers:
-      - name: ${{ defaults.app_name }}-gf-chat-v2
+      - name: ${{ defaults.app_name }}-gf-chat
         image: ghcr.io/lijian2004/gf-chat:latest
         imagePullPolicy: Always
         env:
@@ -171,10 +171,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: ${{ defaults.app_name }}-gf-chat-v2
+  name: ${{ defaults.app_name }}-gf-chat
   labels:
-    app: ${{ defaults.app_name }}-gf-chat-v2
-    cloud.sealos.io/app-deploy-manager: ${{ defaults.app_name }}-gf-chat-v2
+    app: ${{ defaults.app_name }}-gf-chat
+    cloud.sealos.io/app-deploy-manager: ${{ defaults.app_name }}-gf-chat
 spec:
   ports:
   - name: http
@@ -182,14 +182,14 @@ spec:
     targetPort: 8000
     protocol: TCP
   selector:
-    app: ${{ defaults.app_name }}-gf-chat-v2
+    app: ${{ defaults.app_name }}-gf-chat
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: ${{ defaults.app_name }}-gf-chat-v2
+  name: ${{ defaults.app_name }}-gf-chat
   labels:
-    cloud.sealos.io/app-deploy-manager: ${{ defaults.app_name }}-gf-chat-v2
+    cloud.sealos.io/app-deploy-manager: ${{ defaults.app_name }}-gf-chat
     cloud.sealos.io/app-deploy-manager-domain: ${{ defaults.app_host }}
   annotations:
     kubernetes.io/ingress.class: nginx
@@ -212,7 +212,7 @@ spec:
         path: /
         backend:
           service:
-            name: ${{ defaults.app_name }}-gf-chat-v2
+            name: ${{ defaults.app_name }}-gf-chat
             port:
               number: 8000
   tls:
@@ -223,14 +223,14 @@ spec:
 apiVersion: app.sealos.io/v1
 kind: App
 metadata:
-  name: ${{ defaults.app_name }}-gf-chat-v2
+  name: ${{ defaults.app_name }}-gf-chat
   labels:
-    app: ${{ defaults.app_name }}-gf-chat-v2
-    cloud.sealos.io/app-deploy-manager: ${{ defaults.app_name }}-gf-chat-v2
+    app: ${{ defaults.app_name }}-gf-chat
+    cloud.sealos.io/app-deploy-manager: ${{ defaults.app_name }}-gf-chat
 spec:
   data:
     url: https://${{ defaults.app_host }}.${{ SEALOS_CLOUD_DOMAIN }}
   displayType: normal
-  icon: 'https://gf-chat-v2-zuhynnlb.sealosbja.site/static/avatar.png'
+  icon: 'https://gf-chat-zuhynnlb.sealosbja.site/static/avatar.png'
   name: 'AI 女友聊天（GF Chat）'
   type: link
