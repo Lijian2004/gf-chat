@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt gunicorn
 # 复制项目代码（.env 已被 .dockerignore 排除，密钥通过环境变量注入）
 COPY . .
 
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 \
+    TZ=Asia/Shanghai
 
 EXPOSE 8000
 

@@ -60,6 +60,17 @@ const docTextInput = document.getElementById("doc-text-input");
 const docSaveBtn = document.getElementById("doc-save-btn");
 const docCancelBtn = document.getElementById("doc-cancel-btn");
 const docAddBtn = document.getElementById("doc-add-btn");
+const intimacyLevelEl = document.getElementById("intimacy-level");
+const intimacyFillEl = document.getElementById("intimacy-fill");
+const intimacyMetaEl = document.getElementById("intimacy-meta");
+const diaryOpenBtn = document.getElementById("diary-open-btn");
+const diaryOverlayEl = document.getElementById("diary-overlay");
+const diaryCloseBtn = document.getElementById("diary-close-btn");
+const diaryTabsEl = document.getElementById("diary-tabs");
+const diaryBodyEl = document.getElementById("diary-body");
+const diaryGenBtn = document.getElementById("diary-gen-btn");
+const photoBtn = document.getElementById("photo-btn");
+const unreadBadgeEl = document.getElementById("unread-badge");
 
 /* 性格元数据（与后端 PERSONALITIES 保持一致，用于前端展示） */
 const PERSONALITY_META = {
@@ -78,6 +89,7 @@ let gfPersonality = "gentle";
 let greetingText = ""; // 开场白（作为上下文随请求发送，让模型衔接自然）
 let isStreaming = false;
 let controller = null;
+let lastAssistantBubble = null;
 
 /* localStorage 持久化：刷新页面不丢对话 */
 const STORAGE_KEYS = {
@@ -166,6 +178,58 @@ function renderMarkdown(md) {
   });
 
   return text.replace(/\n/g, "<br>");
+}
+
+/* ============ 照片标记（模型输出 [[photo: 画面描述]]） ============ */
+const PHOTO_MARKER_RE = /\[\[photo:\s*([^\]\n]+?)\s*\]\]/gi;
+const photoCache = new Map(); // scene -> 本地图片 URL
+
+function parsePhotoMarkers(text) {
+  const scenes = [];
+  const cleaned = String(text || "").replace(PHOTO_MARKER_RE, (_, scene) => {
+    if (scene.trim()) scenes.push(scene.trim());
+    return "";
+  });
+  return { text: cleaned.replace(/\n{3,}/g, "\n\n").trimEnd(), scenes };
+}
+
+/* 流式期间可能只有半个标记，未闭合的部分也一并去掉，避免闪出标记文本 */
+function stripPhotoMarkers(text) {
+  return String(text || "")
+    .replace(/\[\[photo:[\s\S]*?(?:\]\]|$)/gi, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trimEnd();
+}
+
+/* 在气泡下方异步加载照片（生成需要十几秒，所以先显示占位） */
+async function attachPhotos(bubble, scenes) {
+  if (!bubble || !scenes || !scenes.length) return;
+  if (bubble.querySelector(".bubble-photo")) return; // 同一条消息只挂一张
+  const scene = scenes[0];
+  const wrap = document.createElement("div");
+  wrap.className = "bubble-photo is-loading";
+  wrap.innerHTML = '<span class="photo-spinner"></span><span>她正在拍照…</span>';
+  bubble.appendChild(wrap);
+  scrollToBottom();
+
+  let url = photoCache.get(scene);
+  try {
+    if (!url) {
+      const res = await axios.post("/api/photo", { scene }, { timeout: 360000 });
+      url = res.data && res.data.url;
+      if (!url) throw new Error("没有返回图片");
+      photoCache.set(scene, url);
+    }
+    wrap.classList.remove("is-loading");
+    if (wrap.parentNode !== bubble) bubble.appendChild(wrap); // 防被重渲染摘掉
+    wrap.innerHTML = `<img src="${url}" alt="她发来的照片" loading="lazy" />`;
+    scrollToBottom();
+  } catch (e) {
+    wrap.classList.remove("is-loading");
+    wrap.classList.add("is-error");
+    if (wrap.parentNode !== bubble) bubble.appendChild(wrap);
+    wrap.textContent = `照片没拍成：${apiErrorText(e, "生成失败")}`;
+  }
 }
 
 /* 每 interval 至多执行一次；被跳过的调用在末尾补一次（保证最终态正确渲染） */
@@ -276,7 +340,9 @@ function restoreMessage(m) {
     bubble.innerHTML = escapeHtml(m.content).replace(/\n/g, "<br>");
   } else {
     const bubble = createMessage("assistant");
-    bubble.innerHTML = renderMarkdown(m.content);
+    bubble.innerHTML = renderMarkdown(stripPhotoMarkers(m.content));
+    const { scenes } = parsePhotoMarkers(m.content);
+    if (scenes.length) attachPhotos(bubble, scenes);
   }
 }
 
@@ -289,7 +355,7 @@ function addAssistantPlaceholder() {
 }
 
 function updateBubble(bubble, text) {
-  bubble.innerHTML = renderMarkdown(text);
+  bubble.innerHTML = renderMarkdown(stripPhotoMarkers(text));
 }
 
 /* ============ 语音播报（edge-tts 神经网络语音 + 浏览器兜底） ============ */
@@ -302,6 +368,7 @@ let voicePersonas = [];
 // 把 Markdown 清洗成适合朗读的纯文本
 function textForSpeech(md) {
   return (md || "")
+    .replace(/\[\[photo:[\s\S]*?\]\]/gi, "")
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/`([^`\n]+)`/g, "$1")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
@@ -342,6 +409,7 @@ function speakFallback(text) {
     if (!clean) { resolve(); return; }
     try {
       speechSynthesis.cancel();
+      if (speechSynthesis.paused) speechSynthesis.resume(); // Chrome 长时间后可能卡 paused，导致 speak 无声
       const u = new SpeechSynthesisUtterance(clean);
       u.lang = "zh-CN";
       u.rate = 1.05;
@@ -384,29 +452,36 @@ async function transcribeWav(wavBlob) {
 
 /* 共享：播放音频 Blob（主聊天与通话共用 currentAudio 句柄） */
 function playAudioBlob(blob) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let done = false;
     let url = null;
     let audio = null;
     let timer = null;
-    const finish = () => {
+    const finish = (err) => {
       if (done) return;
       done = true;
       if (timer) clearTimeout(timer);
       if (currentAudio && currentAudio.audio === audio) currentAudio = null;
       if (url) { try { URL.revokeObjectURL(url); } catch (e) {} }
-      resolve();
+      if (err) reject(err); else resolve();
     };
     try {
       url = URL.createObjectURL(blob);
       audio = new Audio(url);
       currentAudio = { audio, url };
-      audio.onended = finish;
-      audio.onerror = finish;
+      audio.onended = () => finish();
+      audio.onerror = () => finish(new Error("audio error"));
       const p = audio.play();
-      if (p && p.catch) p.catch(finish);
-      timer = setTimeout(finish, 120000); // 绝对兜底
-    } catch (e) { finish(); }
+      if (p && p.catch) {
+        p.catch((e) => {
+          // 自动播放被浏览器拦截（NotAllowedError）时抛给上层回退浏览器语音；
+          // 其余（如被打断的 AbortError）静默结束即可。
+          if (e && e.name === "NotAllowedError") finish(new Error("autoplay blocked"));
+          else finish();
+        });
+      }
+      timer = setTimeout(() => finish(), 120000); // 绝对兜底
+    } catch (e) { finish(e); }
   });
 }
 
@@ -1348,10 +1423,12 @@ async function runCallReply(payload, opts = {}) {
   callStreamDone = false;
   callController = new AbortController();
   setCallState("thinking", "思考中…");
+  let finished = false;
 
   const { text: acc, canceled, err } = await streamChat(payload, {
     signal: callController.signal,
     onText: throttle((full) => {
+      if (finished) return;
       if (chatBubble) updateBubble(chatBubble, full);
       // 字幕流式期间用纯文本即可（避免每个分片全量重渲染 Markdown），结束后统一渲染
       transcriptBubble.textContent = full;
@@ -1370,10 +1447,16 @@ async function runCallReply(payload, opts = {}) {
     finalText += `\n\n[请求失败] ${apiErrorText(err, "网络错误")}`;
     if (chatBubble) chatBubble.classList.add("bubble--error");
   }
-  if (chatBubble) updateBubble(chatBubble, finalText);
+  finished = true;
+  if (chatBubble) {
+    updateBubble(chatBubble, finalText);
+    lastAssistantBubble = chatBubble;
+    const { scenes } = parsePhotoMarkers(finalText);
+    if (scenes.length) attachPhotos(chatBubble, scenes);
+  }
   callController = null;
   callStreamDone = true;
-  transcriptBubble.innerHTML = renderMarkdown(finalText || "（未收到回复）");
+  transcriptBubble.innerHTML = renderMarkdown(stripPhotoMarkers(finalText) || "（未收到回复）");
   callTranscriptEl.scrollTop = callTranscriptEl.scrollHeight;
 
   if (!isGreeting && acc.trim()) {
@@ -1425,10 +1508,12 @@ async function streamReply(payload, opts = {}) {
   isStreaming = true;
   controller = new AbortController();
   setStreamingUI(true);
+  let finished = false; // 收尾后丢弃节流回调，避免覆盖已挂载的照片
 
   const { text: acc, canceled, err } = await streamChat(payload, {
     signal: controller.signal,
     onText: throttle((full) => {
+      if (finished) return;
       updateBubble(bubble, full);
       scrollToBottom();
     }, 80),
@@ -1451,7 +1536,11 @@ async function streamReply(payload, opts = {}) {
     finalText += `\n\n[请求失败] ${apiErrorText(err, "网络错误")}`;
     bubble.classList.add("bubble--error");
   }
+  finished = true;
   updateBubble(bubble, finalText);
+  lastAssistantBubble = bubble;
+  const { scenes } = parsePhotoMarkers(finalText);
+  if (scenes.length) attachPhotos(bubble, scenes);
 
   isStreaming = false;
   controller = null;
@@ -1467,6 +1556,9 @@ async function sendMessage(userText) {
   const text = (userText ?? inputEl.value).trim();
   if (!text) return;
 
+  markActivity();
+  setUnread(0);
+  maybeAskNotify();
   showEmpty(false);
   addUserMessage(text);
   history.push({ role: "user", content: text });
@@ -1481,7 +1573,36 @@ async function sendMessage(userText) {
     saveState();
   }
   scheduleMemoryRefresh(); // 后台记忆抽取完成后刷新面板（防抖）
+  refreshIntimacy();
   inputEl.focus();
+}
+
+/* 点相机：让她先聊一句，再附一张照片；模型没给画面时用兜底场景直接生成 */
+async function requestPhoto() {
+  if (isStreaming) return;
+  const userText = "发张照片给我看看嘛～";
+  showEmpty(false);
+  markActivity();
+  setUnread(0);
+  addUserMessage(userText);
+  history.push({ role: "user", content: userText });
+  chatSpeech.reset();
+
+  photoBtn.disabled = true;
+  try {
+    const reply = await streamReply(buildChatPayload({ messages: history.slice() }), { speech: false });
+    if (reply.trim()) {
+      history.push({ role: "assistant", content: reply });
+      saveState();
+    }
+    if (!parsePhotoMarkers(reply).scenes.length && lastAssistantBubble) {
+      attachPhotos(lastAssistantBubble, ["此刻的自拍，正在做的事，自然光线"]);
+    }
+    refreshIntimacy();
+    scheduleMemoryRefresh();
+  } finally {
+    photoBtn.disabled = false;
+  }
 }
 
 async function startGreeting() {
@@ -1538,6 +1659,7 @@ async function startSetup() {
   messagesEl.querySelectorAll(".message").forEach((n) => n.remove());
   showEmpty(false);
   inputEl.focus();
+  refreshIntimacy();
 
   await startGreeting();
 }
@@ -1601,6 +1723,7 @@ personaGridEl.addEventListener("click", (e) => {
   gfPersonality = card.dataset.personality;
   syncPersonaSelection();
   checkStartEnabled();
+  refreshIntimacy();
 });
 
 personaAddBtn.addEventListener("click", () => {
@@ -1812,14 +1935,318 @@ docSaveBtn.addEventListener("click", async () => {
 /* 动态获取后端模型名，展示在侧边栏徽章 */
 async function fetchModelBadge() {
   const badge = document.querySelector(".model-badge");
-  if (!badge) return;
   try {
     const res = await axios.get("/api/health");
-    if (res.data && res.data.model) badge.textContent = res.data.model;
+    if (!res.data) return;
+    if (badge && res.data.model) badge.textContent = res.data.model;
+    // 照片功能不可用（如容器里没有 dreamina-canvas CLI / 未登录）时隐藏相机按钮
+    if (photoBtn && res.data.photo === false) {
+      photoBtn.style.display = "none";
+    }
   } catch (e) {
     /* 忽略，保留默认文案 */
   }
 }
+
+/* ============ 亲密度 ============ */
+let intimacyInfo = null;
+
+async function refreshIntimacy() {
+  try {
+    const res = await axios.get("/api/intimacy", {
+      params: { space: memSpace() },
+      timeout: 8000,
+    });
+    renderIntimacy(res.data);
+  } catch (e) {
+    /* 静默 */
+  }
+}
+
+function renderIntimacy(info) {
+  if (!info) return;
+  const prev = intimacyInfo;
+  intimacyInfo = info;
+  intimacyLevelEl.textContent = `Lv.${info.level} ${info.level_name || ""}`;
+  intimacyFillEl.style.width = `${Math.round((info.progress || 0) * 100)}%`;
+  if (prev && info.level > prev.level) {
+    intimacyMetaEl.textContent = `关系升级了！现在是「${info.level_name}」`;
+    intimacyMetaEl.classList.add("is-up");
+    setTimeout(() => intimacyMetaEl.classList.remove("is-up"), 8000);
+  } else {
+    intimacyMetaEl.textContent = info.next
+      ? `好感 ${info.score} · 距下一级还差 ${info.to_next}`
+      : `好感 ${info.score} · 已经是最亲密`;
+  }
+}
+
+/* ============ 她的日记 / 时间线 / 她眼中的你 ============ */
+let diaryTab = "diary";
+let diaryEntries = [];
+let diaryBusy = false;
+
+function openDiary() {
+  diaryOverlayEl.classList.remove("hidden");
+  markActivity();
+  setUnread(0);
+  loadDiaryTab(diaryTab);
+}
+
+function closeDiary() {
+  diaryOverlayEl.classList.add("hidden");
+}
+
+function setDiaryTab(tab) {
+  diaryTab = tab;
+  diaryTabsEl.querySelectorAll(".diary-tab").forEach((b) => {
+    b.classList.toggle("selected", b.dataset.tab === tab);
+  });
+  diaryGenBtn.style.display = tab === "diary" ? "" : "none";
+}
+
+async function loadDiaryTab(tab) {
+  setDiaryTab(tab);
+  diaryBodyEl.innerHTML = '<p class="diary-empty">加载中…</p>';
+  if (tab === "diary") return loadDiaryEntries();
+  if (tab === "timeline") return loadTimeline();
+  return loadProfileCard();
+}
+
+async function generateDiary(force) {
+  try {
+    const res = await axios.post(
+      "/api/diary/generate",
+      {
+        messages: history.slice(-40),
+        personality: gfPersonality,
+        name: gfName,
+        force: !!force,
+      },
+      { timeout: 120000 }
+    );
+    return res.data;
+  } catch (e) {
+    return { error: apiErrorText(e, "生成失败") };
+  }
+}
+
+async function loadDiaryEntries() {
+  try {
+    const res = await axios.get("/api/diary", {
+      params: { space: memSpace() },
+      timeout: 12000,
+    });
+    diaryEntries = Array.isArray(res.data) ? res.data : [];
+    const today = new Date().toLocaleDateString("sv"); // yyyy-mm-dd
+    if (!diaryEntries.some((e) => e.date === today) && history.length) {
+      diaryBodyEl.innerHTML = '<p class="diary-empty">她正在写今天的日记…</p>';
+      const entry = await generateDiary(false);
+      if (entry && !entry.error) diaryEntries.unshift(entry);
+    }
+    renderDiaryEntries(diaryEntries);
+  } catch (e) {
+    diaryBodyEl.innerHTML = `<p class="diary-empty">日记加载失败：${escapeHtml(
+      apiErrorText(e, "请稍后再试")
+    )}</p>`;
+  }
+}
+
+function renderDiaryEntries(entries) {
+  if (!entries.length) {
+    diaryBodyEl.innerHTML =
+      '<p class="diary-empty">还没有日记。<br>和她多聊几句，她会把心事写在这里。</p>';
+    return;
+  }
+  diaryBodyEl.innerHTML = entries
+    .map(
+      (e) => `
+    <div class="diary-entry">
+      <div class="diary-entry__date">
+        ${escapeHtml(e.date || "")}
+        ${e.mood ? `<span class="diary-mood">${escapeHtml(e.mood)}</span>` : ""}
+      </div>
+      <div class="diary-entry__text">${escapeHtml(e.text || "")}</div>
+      ${
+        e.highlights && e.highlights.length
+          ? `<div class="diary-highlights">${e.highlights
+              .map((h) => `<span>${escapeHtml(h)}</span>`)
+              .join("")}</div>`
+          : ""
+      }
+    </div>`
+    )
+    .join("");
+}
+
+function fmtTimelineTime(ts) {
+  const d = new Date((Number(ts) || 0) * 1000);
+  if (!d.getTime()) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+async function loadTimeline() {
+  try {
+    const res = await axios.get("/api/timeline", {
+      params: { space: memSpace() },
+      timeout: 12000,
+    });
+    const items = Array.isArray(res.data) ? res.data : [];
+    if (!items.length) {
+      diaryBodyEl.innerHTML = '<p class="diary-empty">你们的故事才刚刚开始。</p>';
+      return;
+    }
+    diaryBodyEl.innerHTML = items
+      .map(
+        (it) => `
+      <div class="timeline-item timeline-item--${escapeHtml(it.type || "event")}">
+        <div class="timeline-title">${escapeHtml(it.title || "")}<span class="timeline-time">${fmtTimelineTime(it.ts)}</span></div>
+        ${it.desc ? `<div class="timeline-desc">${escapeHtml(it.desc)}</div>` : ""}
+      </div>`
+      )
+      .join("");
+  } catch (e) {
+    diaryBodyEl.innerHTML = `<p class="diary-empty">时间线加载失败：${escapeHtml(
+      apiErrorText(e, "请稍后再试")
+    )}</p>`;
+  }
+}
+
+async function loadProfileCard() {
+  try {
+    const res = await axios.get("/api/profile", {
+      params: { space: memSpace() },
+      timeout: 90000,
+    });
+    const text = (res.data && res.data.text) || "";
+    diaryBodyEl.innerHTML = text
+      ? `<div class="diary-profile-text">${escapeHtml(text)}</div>`
+      : '<p class="diary-empty">她还不够了解你。<br>多聊聊天，她会慢慢写出她眼中的你。</p>';
+  } catch (e) {
+    diaryBodyEl.innerHTML = `<p class="diary-empty">生成失败：${escapeHtml(
+      apiErrorText(e, "请稍后再试")
+    )}</p>`;
+  }
+}
+
+diaryOpenBtn.addEventListener("click", openDiary);
+diaryCloseBtn.addEventListener("click", closeDiary);
+diaryOverlayEl.addEventListener("click", (e) => {
+  if (e.target === diaryOverlayEl) closeDiary();
+});
+diaryTabsEl.addEventListener("click", (e) => {
+  const tab = e.target.closest(".diary-tab");
+  if (tab && tab.dataset.tab !== diaryTab) loadDiaryTab(tab.dataset.tab);
+});
+diaryGenBtn.addEventListener("click", async () => {
+  if (diaryBusy) return;
+  diaryBusy = true;
+  diaryGenBtn.disabled = true;
+  diaryBodyEl.innerHTML = '<p class="diary-empty">她正在写今天的日记…</p>';
+  const entry = await generateDiary(true);
+  diaryBusy = false;
+  diaryGenBtn.disabled = false;
+  if (entry && !entry.error) {
+    diaryEntries = [entry, ...diaryEntries.filter((e) => e.date !== entry.date)];
+    renderDiaryEntries(diaryEntries);
+  } else {
+    diaryBodyEl.innerHTML = `<p class="diary-empty">${escapeHtml(
+      (entry && entry.error) || "生成失败"
+    )}</p>`;
+  }
+});
+
+/* ============ 她主动找你 ============ */
+const PROACTIVE_IDLE_MS = 25 * 60 * 1000; // 25 分钟没互动才考虑
+const PROACTIVE_POLL_MS = 60 * 1000;
+let lastUserActivity = Date.now();
+let proactiveTimer = null;
+let proactiveBusy = false;
+let unreadCount = 0;
+let notifyAsked = false;
+
+function markActivity() {
+  lastUserActivity = Date.now();
+}
+
+function setUnread(n) {
+  unreadCount = n;
+  unreadBadgeEl.classList.toggle("hidden", n <= 0);
+  unreadBadgeEl.textContent = n > 0 ? `${n} 条新消息` : "";
+  const base = gfName ? `${gfName} · 你的专属角色` : "角色扮演 Agent · 你的专属陪伴";
+  document.title = n > 0 ? `💬 (${n}) ${base}` : base;
+}
+
+function maybeAskNotify() {
+  if (notifyAsked || !("Notification" in window)) return;
+  notifyAsked = true;
+  if (Notification.permission === "default") {
+    Notification.requestPermission().catch(() => {});
+  }
+}
+
+function notifyProactive(text) {
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  try {
+    new Notification(gfName || "她", { body: text, icon: AVATAR_URL });
+  } catch (e) {
+    /* 部分浏览器不支持构造式通知 */
+  }
+}
+
+async function checkProactive() {
+  if (proactiveBusy || isStreaming || callActive) return;
+  if (!history.length) return;
+  if (Date.now() - lastUserActivity < PROACTIVE_IDLE_MS) return;
+
+  proactiveBusy = true;
+  try {
+    const res = await axios.post(
+      "/api/proactive",
+      {
+        messages: history.slice(-8),
+        name: gfName,
+        personality: gfPersonality,
+        location: locationPayload(),
+      },
+      { timeout: 45000 }
+    );
+    const msg = res.data && res.data.message;
+    if (msg) {
+      showEmpty(false);
+      const bubble = createMessage("assistant");
+      updateBubble(bubble, msg);
+      lastAssistantBubble = bubble;
+      history.push({ role: "assistant", content: msg });
+      saveState();
+      setUnread(unreadCount + 1);
+      notifyProactive(msg);
+      scrollToBottom();
+    }
+  } catch (e) {
+    /* 静默：主动消息失败不打扰用户 */
+  } finally {
+    proactiveBusy = false;
+    lastUserActivity = Date.now(); // 无论成败都重新计时，避免每分钟重试
+  }
+}
+
+function startProactiveLoop() {
+  if (proactiveTimer) return;
+  proactiveTimer = setInterval(checkProactive, PROACTIVE_POLL_MS);
+}
+
+photoBtn.addEventListener("click", requestPhoto);
+
+window.addEventListener("focus", () => {
+  markActivity();
+  setUnread(0);
+});
+inputEl.addEventListener("focus", () => {
+  markActivity();
+  setUnread(0);
+});
+messagesEl.addEventListener("click", () => setUnread(0));
 
 /* ============ 访问密码登录 ============ */
 async function checkAuth() {
@@ -1864,6 +2291,7 @@ function bootstrapAfterAuth() {
   loadPersonas();
   initLocation();
   refreshMemoryPanel();
+  refreshIntimacy();
 }
 
 (async function init() {
@@ -1925,4 +2353,9 @@ function bootstrapAfterAuth() {
     showEmpty(history.length === 0);
     nameInput.focus();
   }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") markActivity();
+  });
+  startProactiveLoop();
 })();

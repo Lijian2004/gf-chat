@@ -21,7 +21,8 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import anthropic
 from dotenv import load_dotenv
@@ -367,14 +368,25 @@ def _client_ip():
     return request.remote_addr or ""
 
 
+# 服务器可能跑在 UTC 时区的容器里（如 Sealos），时间统一按北京时间取
+try:
+    CN_TZ = ZoneInfo("Asia/Shanghai")
+except Exception:  # noqa: BLE001  tzdata 缺失时退回固定 +8（中国无夏令时）
+    CN_TZ = timezone(timedelta(hours=8))
+
+
 def now_text():
-    now = datetime.now()
+    now = datetime.now(CN_TZ)
     return f"{now.year}年{now.month}月{now.day}日 {WEEKDAYS[now.weekday()]} {now.strftime('%H:%M')}"
 
 # 性格/角色卡已迁移至 agent/persona.py（预设 + 自定义角色卡）
 # 长期记忆：agent/memory.py；轻量 RAG：agent/rag.py；多模型路由：agent/router.py
+from agent import diary as agent_diary
+from agent import intimacy as agent_intimacy
 from agent import memory as agent_memory
 from agent import persona as agent_persona
+from agent import photo as agent_photo
+from agent import proactive as agent_proactive
 from agent import rag as agent_rag
 from agent import router as agent_router
 
@@ -388,6 +400,20 @@ def _sanitize_prompt_text(value, limit):
 def sanitize_name(name):
     """清洗名字：去掉控制字符、限制长度，避免破坏 prompt。"""
     return _sanitize_prompt_text(name, 20)
+
+
+def _parse_location(data):
+    """聊天与主动消息共用的位置字段清洗（前端定位/手动设置后随请求携带）。"""
+    loc = data.get("location")
+    if not isinstance(loc, dict):
+        return None
+    location = {
+        "city": _sanitize_prompt_text(loc.get("city"), 30),
+        "weather_text": _sanitize_prompt_text(loc.get("weather_text"), 200),
+    }
+    if not (location["city"] or location["weather_text"]):
+        return None
+    return location
 
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
@@ -408,13 +434,13 @@ def index():
 
 @app.route("/api/health")
 def health():
-    """健康检查，暴露主力对话模型名给前端展示。"""
+    """健康检查，暴露主力对话模型名与照片功能可用性给前端展示。"""
     try:
         primary = agent_router._PROVIDERS.get(agent_router.CHAT_CHAIN[0])
         model = primary["model"] if primary else "未配置"
     except Exception:  # noqa: BLE001
         model = "未配置"
-    return jsonify({"status": "ok", "model": model})
+    return jsonify({"status": "ok", "model": model, "photo": agent_photo.available()})
 
 
 @app.route("/api/auth")
@@ -663,6 +689,13 @@ def _extraction_worker(space, user_text, assistant_text, history_tail):
         store = agent_memory.get_store(space)
         ids = agent_memory.extract_and_store(store, user_text, assistant_text, history_tail)
         if ids:
+            # 被记住本身就是亲近的信号：新记忆加好感（纠正类更重要，单轮最多 +3）
+            new_ids = set(ids)
+            points = sum(
+                3 if m.get("type") == "correction" else 1
+                for m in store.items if m.get("id") in new_ids
+            )
+            agent_intimacy.add(space, min(3, points), "memory", cap_daily=False)
             print(f"[memory] +{len(ids)} 条 ({store.space})", flush=True)
     except Exception as e:  # noqa: BLE001
         print(f"[memory] 抽取线程异常: {e}", flush=True)
@@ -682,15 +715,7 @@ def chat():
     greeting_text = _sanitize_prompt_text(data.get("greeting_text"), 200)
 
     # 位置信息（前端定位/手动设置后随请求携带）：注入 system prompt
-    loc = data.get("location")
-    location = None
-    if isinstance(loc, dict):
-        location = {
-            "city": _sanitize_prompt_text(loc.get("city"), 30),
-            "weather_text": _sanitize_prompt_text(loc.get("weather_text"), 200),
-        }
-        if not (location["city"] or location["weather_text"]):
-            location = None
+    location = _parse_location(data)
 
     if not _valid_messages(messages):
         return jsonify({"error": "messages 格式不正确"}), 400
@@ -718,6 +743,8 @@ def chat():
         memories_block=memories_block, rag_block=rag_block,
         lessons_block=_load_lessons(), call_mode=call_mode,
         greeting_text=greeting_text,
+        intimacy_block=agent_intimacy.prompt_block(space),
+        photo_hint=agent_photo.available() and not call_mode,
     )
 
     # 只携带最近 N 条历史，防止上下文无限膨胀
@@ -753,9 +780,10 @@ def chat():
             print(f"[chat] 全部模型失败: {exc}", flush=True)
             yield "\n\n[错误] 所有模型均不可用，请检查网络或 API Key。"
         finally:
-            # 非开场白的完整一轮：后台抽取长期记忆（不阻塞响应）
+            # 非开场白的完整一轮：加好感并后台抽取长期记忆（不阻塞响应）
             full_text = "".join(acc)
             if not greeting and full_text and not _looks_like_error(full_text):
+                agent_intimacy.add_turn(space)
                 threading.Thread(
                     target=_extraction_worker,
                     args=(space, last_user, full_text, messages[-6:]),
@@ -849,6 +877,140 @@ def docs_delete(doc_id):
     store = agent_rag.get_rag_store(_resolve_space(request.args.get("space", "default")))
     ok = store.delete_doc(doc_id)
     return (jsonify({"ok": True}) if ok else (jsonify({"error": "文档不存在"}), 404))
+
+
+# ============ 亲密度 / 照片 / 日记 / 时间线 / 主动消息 ============
+
+@app.route("/api/intimacy")
+def intimacy_info():
+    """关系进度：分数、等级、距下一级还差多少。"""
+    space = _resolve_space(request.args.get("space", "default"))
+    return jsonify(agent_intimacy.info(space))
+
+
+@app.route("/api/photo", methods=["POST", "OPTIONS"])
+def photo_generate():
+    """生成一张她的照片：{ scene, force }，返回本地图片 URL。"""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    data = request.get_json(silent=True) or {}
+    scene = _sanitize_prompt_text(data.get("scene") or data.get("prompt"), 200)
+    if not scene:
+        return jsonify({"error": "缺少画面描述"}), 400
+    if not agent_photo.available():
+        return jsonify({"error": "dreamina-canvas CLI 未安装或未登录"}), 503
+    try:
+        info = agent_photo.generate(scene, force=bool(data.get("force")))
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": f"照片生成失败：{e}"}), 502
+    return jsonify(info)
+
+
+@app.route("/api/diary")
+def diary_list():
+    space = _resolve_space(request.args.get("space", "default"))
+    return jsonify(agent_diary.list_entries(space))
+
+
+@app.route("/api/diary/generate", methods=["POST", "OPTIONS"])
+def diary_generate():
+    """写某天的日记：{ messages, personality, name, date, force }。"""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    data = request.get_json(silent=True) or {}
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return jsonify({"error": "messages 格式不正确"}), 400
+    card = agent_persona.get_card(data.get("personality") or "gentle")
+    name = sanitize_name(data.get("name"))
+    if name:
+        card = {**card, "name": name}
+    try:
+        entry = agent_diary.generate(
+            card["key"], card, messages,
+            date_str=_sanitize_prompt_text(data.get("date"), 10) or None,
+            force=bool(data.get("force")),
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(entry)
+
+
+@app.route("/api/profile")
+def profile_card():
+    """「她眼中的你」：从长期记忆生成，记忆不变则复用缓存。"""
+    space = _resolve_space(request.args.get("space", "default"))
+    card = agent_persona.get_card(space)
+    store = agent_memory.get_store(space)
+    items = [m["content"] for m in sorted(store.items, key=lambda m: -m["ts"])[:40]]
+    try:
+        return jsonify(agent_diary.profile(
+            space, card, items, force=request.args.get("force") == "1"
+        ))
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": f"生成失败：{e}"}), 502
+
+
+@app.route("/api/timeline")
+def timeline():
+    """关系时间线：初次相遇 + 等级里程碑 + 重要事件 + 日记。"""
+    space = _resolve_space(request.args.get("space", "default"))
+    st = agent_intimacy.info(space)
+    items = []
+    if st.get("created"):
+        items.append({
+            "ts": st["created"], "type": "start",
+            "title": "初次相遇", "desc": "你们的故事从这里开始",
+        })
+    for ms in st.get("milestones") or []:
+        items.append({
+            "ts": ms.get("ts") or 0, "type": "level",
+            "title": f"关系升级为「{ms.get('name', '')}」",
+            "desc": f"Lv.{ms.get('level', '')}",
+        })
+    for m in agent_memory.get_store(space).items:
+        if m.get("type") == "event":
+            items.append({
+                "ts": m.get("ts") or 0, "type": "event",
+                "title": "重要的事", "desc": m.get("content", ""),
+            })
+    for e in agent_diary.list_entries(space):
+        items.append({
+            "ts": e.get("ts") or 0, "type": "diary",
+            "title": f"{e.get('date', '')} 的日记",
+            "desc": (e.get("text") or "")[:80],
+        })
+    items.sort(key=lambda x: -float(x.get("ts") or 0))
+    return jsonify(items[:80])
+
+
+@app.route("/api/proactive", methods=["POST", "OPTIONS"])
+def proactive_message():
+    """她主动发一条消息：{ messages, personality, name, location }。"""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    data = request.get_json(silent=True) or {}
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        messages = []
+    if not any(isinstance(m, dict) and m.get("role") == "user" for m in messages):
+        return jsonify({"message": None, "reason": "no-history"})
+
+    card = agent_persona.get_card(data.get("personality") or "gentle")
+    name = sanitize_name(data.get("name"))
+    if name:
+        card = {**card, "name": name}
+
+    space = card["key"]
+    last_user = next(
+        (m["content"] for m in reversed(messages)
+         if isinstance(m, dict) and m.get("role") == "user"), ""
+    )
+    store = agent_memory.get_store(space)
+    memories_block = store.to_prompt(store.search(last_user, k=4))
+    return jsonify(agent_proactive.maybe(
+        space, card, messages, memories_block, _parse_location(data)
+    ))
 
 
 if __name__ == "__main__":

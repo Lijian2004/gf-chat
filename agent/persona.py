@@ -140,7 +140,7 @@ def delete_custom_card(key):
 
 def build_system_prompt(card, now_str, location=None, memories_block="",
                         rag_block="", lessons_block="", call_mode=False,
-                        greeting_text=""):
+                        greeting_text="", intimacy_block="", photo_hint=False):
     """组装 system prompt：角色人设 + 边界约束 + 记忆/文档/复盘区块。"""
     name = card["name"]
     prompt = (
@@ -154,6 +154,8 @@ def build_system_prompt(card, now_str, location=None, memories_block="",
     )
     if greeting_text:
         prompt += f"\n你之前说过的开场白（自然衔接，不要重复）：{greeting_text}"
+    if intimacy_block:
+        prompt += f"\n\n【你与他的关系】{intimacy_block}"
     if location:
         parts = [v for v in (location.get("city"), location.get("weather_text")) if v]
         if parts:
@@ -169,6 +171,14 @@ def build_system_prompt(card, now_str, location=None, memories_block="",
         prompt += (
             "\n\n现在是语音通话场景：像真实通话一样交谈，回复必须非常简短口语化"
             "（一般一两句话、不超过 40 字），不用 Markdown、表情符号、颜文字或括号动作描写。"
+        )
+    if photo_hint:
+        prompt += (
+            "\n\n【照片】你可以给他发照片：当他想看你的样子、你恰好想分享眼前的画面时，"
+            "在回复的最后单独一行输出 [[photo: 画面描述]]，描述只写画面内容"
+            "（你在哪里、在做什么、穿什么、光线氛围），不要写自己的名字。"
+            "系统会把这一行自动渲染成照片，所以你不需要再解释它，也不要用引号包住。"
+            "不要滥用：一次对话最多一张，没有合适场景就不发。"
         )
     prompt += "\n\n【必须遵守的边界】\n" + "\n".join(f"- {b}" for b in bounds)
     return prompt
